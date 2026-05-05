@@ -11,6 +11,8 @@ the blog's prose specification.
 > **Goal of this README:** explain the algorithm and the multi-agent
 > architecture, then map each piece to the corresponding code. Run results
 > from one full session are at the bottom.
+>
+> 中文版：[README.zh-CN.md](README.zh-CN.md)
 
 ---
 
