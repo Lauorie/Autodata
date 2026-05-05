@@ -1,0 +1,51 @@
+# Model assignments. All proxy models speak OpenAI Chat Completions API.
+# `endpoint: proxy` -> wismodel proxy. `endpoint: local_hf` -> in-process HF transformers.
+# `reasoning_effort: none` disables thinking on reasoning-capable models (huge speedup);
+# `reasoning_effort: auto` keeps the model's default behaviour.
+
+challenger:
+  endpoint: proxy
+  model: moonshotai/kimi-k2.6
+  temperature: 0.7
+  max_tokens: 4000
+  reasoning: true
+  reasoning_effort: auto    # keep thinking ON for question design
+
+quality_verifier:
+  endpoint: proxy
+  model: moonshotai/kimi-k2.6
+  temperature: 0.0
+  max_tokens: 1500
+  reasoning: false
+  reasoning_effort: none    # fast yes/no decisions
+
+judge:
+  endpoint: proxy
+  model: moonshotai/kimi-k2.6
+  temperature: 0.0
+  max_tokens: 1500
+  reasoning: false
+  reasoning_effort: none    # fast rubric scoring
+
+strong_solver:
+  endpoint: proxy
+  model: qwen/qwen3.5-397b-a17b
+  temperature: 0.6
+  max_tokens: 1500
+  reasoning: false
+  reasoning_effort: none    # answer the question directly
+
+weak_solver:
+  endpoint: local_hf
+  model: /root/autodl-fs/autodata/Qwen3.5-4B
+  temperature: 0.7
+  max_tokens: 512
+  reasoning: false
+
+meta_optimizer:
+  endpoint: proxy
+  model: moonshotai/kimi-k2.6
+  temperature: 0.4
+  max_tokens: 12000
+  reasoning: true
+  reasoning_effort: auto    # heavy reasoning for code edits

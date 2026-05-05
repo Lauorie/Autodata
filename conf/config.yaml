@@ -1,0 +1,52 @@
+defaults:
+  - models: default
+  - acceptance: default
+  - _self_
+
+run_id: ???
+seed: 42
+
+paths:
+  papers_dir: /root/autodl-fs/autodata/papers-mds
+  outputs_root: /root/autodl-fs/autodata/outputs
+  qwen_model_dir: /root/autodl-fs/autodata/Qwen3.5-4B
+
+inner_loop:
+  max_iterations: 6
+  qa_per_chunk: 1
+  num_solver_samples: 3
+  max_chunk_chars: 12000
+  chunks_per_paper: null   # null = no cap
+
+run:
+  papers_limit: null
+  concurrency: 4
+  chunk_concurrency: 4     # how many chunks to process in parallel
+
+meta:
+  n_generations: 4
+  temperature: 0.1
+  validation_chunks: 8
+
+train:
+  # Defaults sized for 2× A800-80GB. Halve only if OOM.
+  per_device_batch: 8
+  num_generations: 4
+  max_prompt_length: 4096
+  max_completion_length: 384
+  max_length: 4096       # SFT only
+  max_steps: 30          # demo size; bump for a full run
+  learning_rate: 1e-6
+  grad_accum: 1
+  save_steps: 30
+  logging_steps: 2
+  beta: 0.04
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+
+hydra:
+  run:
+    dir: ${paths.outputs_root}/${run_id}
+  job:
+    chdir: false

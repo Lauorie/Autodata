@@ -1,0 +1,17 @@
+# Acceptance criteria from AutoData blog (Agentic Self-Instruct).
+# All criteria must hold simultaneously for a QA pair to be ACCEPTED.
+
+quality_verifier_must_pass: true
+
+# Weak solver: should generally fail
+weak_avg_max: 0.65        # mean rubric score over samples ≤ 0.65
+weak_max_max: 0.75        # max single-sample score ≤ 0.75
+weak_min_required: 0.0    # implicit "no zeros" check enforced separately
+no_zeros: true            # at least one weak sample must be > 0
+
+# Strong solver: should generally succeed but not be saturated
+strong_avg_min: 0.60      # mean rubric score ≥ 0.60
+strong_avg_max: 0.95      # mean rubric score < 0.95
+
+# Gap: discriminative signal
+gap_min: 0.20             # strong_avg - weak_avg ≥ 0.20
