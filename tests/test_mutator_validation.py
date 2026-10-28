@@ -8,10 +8,10 @@ QUALITY_VERIFIER_SYSTEM = "x"
 SOLVER_SYSTEM = "x"
 JUDGE_SYSTEM = "x"
 
-def challenger_user(paper_title, paper_id, chunk_text, feedback=""): return ""
-def quality_verifier_user(paper_title, chunk_text, question, answer, rubric_json): return ""
-def solver_user(chunk_text, question): return ""
-def judge_user(question, reference_answer, candidate_answer, rubric_json): return ""
+def challenger_user(paper_title, paper_id, paper_text, feedback=""): return ""
+def quality_verifier_user(paper_title, paper_text, question_type, context, question, rubric_json): return ""
+def solver_user(context, question): return ""
+def judge_user(context, question, candidate_answer, rubric_json): return ""
 """
 
 

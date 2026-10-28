@@ -1,157 +1,120 @@
-"""End-to-end inner-loop test using fake LLM clients (no network).
+"""End-to-end inner-loop tests with scripted LLM backends (no network).
 
-Validates that:
-- A failing QV makes the loop iterate with QV feedback.
-- A weak/strong gap that crosses thresholds yields ACCEPTED.
-- Without an acceptable round, the loop terminates after max_iterations.
+Pins the paper's data contract (arXiv 2606.25996, Sec 3.1 and Fig 7-9):
+- the challenger and quality verifier read the whole paper;
+- the solvers see only the challenger-written context and the question;
+- the judge grades without the reference answer;
+- malformed challenger output costs one round, not the whole paper.
 """
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
-from typing import Any
-
-from autodata.data_module.chunker import Chunk
-from autodata.llm import LLMClient
 from autodata.pipeline.acceptance import AcceptanceCriteria
-from autodata.pipeline.inner_loop import InnerLoopConfig, run_inner_loop_for_chunk
+from autodata.pipeline.inner_loop import InnerLoopConfig, run_inner_loop_for_paper
+from tests.fakes import (
+    RUBRIC,
+    STRONG_LOW_PER,
+    STRONG_PER,
+    WEAK_PER,
+    ScriptedBackend,
+    challenger_payload,
+    judge_by_solver,
+    make_clients,
+    make_paper,
+    qv_payload,
+)
 
 
-@dataclass
-class _FakeBackend:
-    """Returns canned responses keyed on which role is calling."""
-    handlers: dict[str, list[str]]
-
-    def chat(self, role_cfg, messages):
-        h = self.handlers.get(role_cfg.role, [])
-        if not h:
-            raise RuntimeError(f"no handler left for role {role_cfg.role}")
-        return h.pop(0)
+def _cfg(max_iterations: int = 3) -> InnerLoopConfig:
+    return InnerLoopConfig(max_iterations=max_iterations, num_solver_samples=2,
+                           parallel_solvers=False)
 
 
-def _client(role: str, backend) -> LLMClient:
-    from autodata.llm.client import LLMRoleConfig
-    return LLMClient(LLMRoleConfig(role=role, endpoint="proxy", model="fake"), backend)
-
-
-def _qa_json() -> str:
-    return json.dumps({
-        "question": "Why does X imply Y in this paper's setup?",
-        "reference_answer": "Because of the assumption stated in section 3.",
-        "rubric": {
-            "criteria": [
-                {"description": "answer mentions assumption from section 3", "weight": 4},
-                {"description": "answer makes the implication X -> Y explicit", "weight": 3},
-            ]
-        }
-    })
-
-
-def _judge_json(per: list[float]) -> str:
-    return json.dumps({"per_criterion": per, "feedback": "ok"})
-
-
-def _make_chunk() -> Chunk:
-    return Chunk(
-        paper_id="papX", title="Paper X", section="Method",
-        text="Section 3 assumes A. Therefore X implies Y. " * 30,
-        chunk_id="papX::01::00",
-    )
-
-
-def _common_inner_cfg() -> InnerLoopConfig:
-    return InnerLoopConfig(max_iterations=3, num_solver_samples=2,
-                           qa_per_chunk=1, parallel_solvers=False)
-
-
-def test_acceptance_path() -> None:
-    # Round 0: QV passes, weak fails, strong succeeds, gap big -> ACCEPTED.
-    backend = _FakeBackend(handlers={
-        "challenger": [_qa_json()],
-        "quality_verifier": [json.dumps({"passed": True, "feedback": "ok", "issues": []})],
-        # 2 weak samples * (no judge for solver text) followed by 2 judge calls
-        "weak_solver": ["weak ans 1", "weak ans 2"],
-        "strong_solver": ["strong ans 1", "strong ans 2"],
-        # JUDGE order: weak1, weak2, strong1, strong2 (parallel pool may shuffle within each pair,
-        # but the *pair* of weak judge calls fires before the strong pair starts).
-        "judge": [
-            _judge_json([0.3, 0.3]),  # weak1 -> 0.3*4+0.3*3 / 7 = 0.30
-            _judge_json([0.3, 0.4]),  # weak2 -> 0.34
-            _judge_json([0.9, 0.9]),  # strong1 -> 0.90
-            _judge_json([0.95, 0.85]),  # strong2 -> ~0.91
-        ],
-    })
-    clients = {
-        "challenger": _client("challenger", backend),
-        "quality_verifier": _client("quality_verifier", backend),
-        "weak_solver": _client("weak_solver", backend),
-        "strong_solver": _client("strong_solver", backend),
-        "judge": _client("judge", backend),
+def _backend(**handlers) -> ScriptedBackend:
+    base = {
+        "challenger": lambda m: challenger_payload(),
+        "quality_verifier": lambda m: qv_payload(),
+        "weak_solver": lambda m: "WEAK-ANSWER",
+        "strong_solver": lambda m: "STRONG-ANSWER",
+        "judge": judge_by_solver(WEAK_PER, STRONG_PER),
     }
-    qa, rounds = run_inner_loop_for_chunk(
-        _make_chunk(), clients, AcceptanceCriteria(), _common_inner_cfg(),
-    )
+    base.update(handlers)
+    return ScriptedBackend(handlers=base)
+
+
+def test_accepts_discriminative_question() -> None:
+    backend = _backend()
+    qa, rounds = run_inner_loop_for_paper(make_paper(), make_clients(backend),
+                                          AcceptanceCriteria(), _cfg())
     assert qa is not None
-    assert len(rounds) == 1
-    assert rounds[0].accepted is True
+    assert qa.paper_id == "papX"
+    assert qa.question_type == "failure mode prediction"
+    assert qa.skill_tags == ["causal_reasoning", "counterfactual"]
+    assert len(rounds) == 1 and rounds[0].accepted
+    assert rounds[0].acceptance["weak_avg"] == 0.5
+    assert abs(rounds[0].acceptance["strong_avg"] - 16 / 18) < 1e-9
 
 
 def test_qv_failure_iterates() -> None:
-    backend = _FakeBackend(handlers={
-        "challenger": [_qa_json(), _qa_json()],
-        "quality_verifier": [
-            json.dumps({"passed": False, "feedback": "context leak", "issues": ["context_leak"]}),
-            json.dumps({"passed": True, "feedback": "ok", "issues": []}),
-        ],
-        "weak_solver": ["weak1", "weak2"],
-        "strong_solver": ["strong1", "strong2"],
-        "judge": [
-            _judge_json([0.3, 0.3]),
-            _judge_json([0.3, 0.3]),
-            _judge_json([0.9, 0.9]),
-            _judge_json([0.9, 0.9]),
-        ],
-    })
-    clients = {
-        "challenger": _client("challenger", backend),
-        "quality_verifier": _client("quality_verifier", backend),
-        "weak_solver": _client("weak_solver", backend),
-        "strong_solver": _client("strong_solver", backend),
-        "judge": _client("judge", backend),
-    }
-    qa, rounds = run_inner_loop_for_chunk(
-        _make_chunk(), clients, AcceptanceCriteria(), _common_inner_cfg(),
-    )
+    backend = _backend(quality_verifier=[
+        qv_payload("FAIL", check_1_verdict="LEAKS_ANSWER", feedback="context gives it away"),
+        qv_payload(),
+    ])
+    qa, rounds = run_inner_loop_for_paper(make_paper(), make_clients(backend),
+                                          AcceptanceCriteria(), _cfg())
     assert qa is not None
-    # Round 0 was QV-rejected, round 1 accepted.
-    assert len(rounds) == 2
-    assert rounds[0].accepted is False
-    assert rounds[1].accepted is True
+    assert [r.accepted for r in rounds] == [False, True]
+    assert rounds[0].qv_verdict["passed"] is False
 
 
 def test_exhausts_iterations() -> None:
-    # Strong always too low -> never accepted.
-    n_iters = 2
-    backend = _FakeBackend(handlers={
-        "challenger": [_qa_json()] * n_iters,
-        "quality_verifier": [json.dumps({"passed": True, "feedback": "", "issues": []})] * n_iters,
-        "weak_solver": ["w"] * (2 * n_iters),
-        "strong_solver": ["s"] * (2 * n_iters),
-        "judge": ([_judge_json([0.3, 0.3])] * 2 + [_judge_json([0.4, 0.4])] * 2) * n_iters,
-    })
-    clients = {
-        "challenger": _client("challenger", backend),
-        "quality_verifier": _client("quality_verifier", backend),
-        "weak_solver": _client("weak_solver", backend),
-        "strong_solver": _client("strong_solver", backend),
-        "judge": _client("judge", backend),
-    }
-    qa, rounds = run_inner_loop_for_chunk(
-        _make_chunk(), clients, AcceptanceCriteria(),
-        InnerLoopConfig(max_iterations=n_iters, num_solver_samples=2,
-                        qa_per_chunk=1, parallel_solvers=False),
-    )
+    backend = _backend(judge=judge_by_solver(WEAK_PER, STRONG_LOW_PER))
+    qa, rounds = run_inner_loop_for_paper(make_paper(), make_clients(backend),
+                                          AcceptanceCriteria(), _cfg(max_iterations=2))
     assert qa is None
-    assert len(rounds) == n_iters
-    assert all(not r.accepted for r in rounds)
+    assert len(rounds) == 2
+    assert not any(r.accepted for r in rounds)
+
+
+def test_challenger_and_verifier_read_the_whole_paper() -> None:
+    tail = "TAIL-OF-PAPER-SENTINEL"
+    paper = make_paper("# Long paper\n\n" + "filler sentence. " * 4000 + tail)
+    backend = _backend()
+    run_inner_loop_for_paper(paper, make_clients(backend), AcceptanceCriteria(), _cfg())
+    assert tail in backend.text_seen_by("challenger")
+    assert tail in backend.text_seen_by("quality_verifier")
+
+
+def test_solvers_see_context_not_paper() -> None:
+    paper_marker = "PAPER-BODY-SENTINEL"
+    context = "CHALLENGER-CONTEXT-SENTINEL: a team distils a large model."
+    paper = make_paper(f"# Paper X\n\n{paper_marker} " + "method details. " * 200)
+    backend = _backend(challenger=lambda m: challenger_payload(context=context))
+    run_inner_loop_for_paper(paper, make_clients(backend), AcceptanceCriteria(), _cfg())
+    for solver in ("weak_solver", "strong_solver"):
+        seen = backend.text_seen_by(solver)
+        assert context in seen
+        assert "Which training change would remove the mismatch" in seen
+        assert paper_marker not in seen
+
+
+def test_judge_never_sees_reference_answer() -> None:
+    reference = "REFERENCE-ANSWER-SENTINEL"
+    backend = _backend(challenger=lambda m: challenger_payload(reference_answer=reference))
+    run_inner_loop_for_paper(make_paper(), make_clients(backend), AcceptanceCriteria(), _cfg())
+    judged = backend.text_seen_by("judge")
+    assert "STRONG-ANSWER" in judged
+    assert reference not in judged
+
+
+def test_malformed_rubric_costs_one_round() -> None:
+    bad_rubric = [dict(RUBRIC[0], weight=0)] + RUBRIC[1:]
+    backend = _backend(challenger=[challenger_payload(rubric=bad_rubric), challenger_payload()])
+    qa, rounds = run_inner_loop_for_paper(make_paper(), make_clients(backend),
+                                          AcceptanceCriteria(), _cfg())
+    assert qa is not None
+    assert len(rounds) == 2
+    assert rounds[0].error is not None and not rounds[0].accepted
+    # The second challenger call carries the validation error back as feedback.
+    challenger_calls = [msgs for role, msgs in backend.calls if role == "challenger"]
+    assert "weight" in challenger_calls[1][-1]["content"]

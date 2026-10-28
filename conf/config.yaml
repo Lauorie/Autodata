@@ -13,20 +13,17 @@ paths:
 
 inner_loop:
   max_iterations: 6
-  qa_per_chunk: 1
   num_solver_samples: 3
-  max_chunk_chars: 12000
-  chunks_per_paper: null   # null = no cap
 
 run:
   papers_limit: null
   concurrency: 4
-  chunk_concurrency: 4     # how many chunks to process in parallel
+  paper_concurrency: 4     # how many papers to process in parallel
 
 meta:
   n_generations: 4
   temperature: 0.1
-  validation_chunks: 8
+  validation_papers: 8
 
 train:
   # Defaults sized for 2× A800-80GB. Halve only if OOM.

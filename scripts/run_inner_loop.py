@@ -1,4 +1,4 @@
-"""Run the Agentic Self-Instruct inner loop over all chunks of all papers.
+"""Run the Agentic Self-Instruct inner loop over every paper (one task per paper).
 
 Usage (from repo root, on remote):
     python scripts/run_inner_loop.py run_id=smoke run.papers_limit=5
@@ -8,10 +8,8 @@ Usage (from repo root, on remote):
 from __future__ import annotations
 
 import json
-import logging
 import time
 from pathlib import Path
-from typing import Any
 
 import hydra
 from dotenv import load_dotenv
@@ -21,9 +19,9 @@ from autodata.config_runtime import (
     build_client_pool,
     role_configs_from_dictconfig,
 )
-from autodata.data_module import chunk_paper, iter_papers
+from autodata.data_module import iter_papers
 from autodata.pipeline.acceptance import AcceptanceCriteria
-from autodata.pipeline.inner_loop import InnerLoopConfig, run_inner_loop_for_chunk
+from autodata.pipeline.inner_loop import InnerLoopConfig, run_inner_loop_for_paper
 from autodata.utils import get_logger, set_seed, setup_logging, write_json
 
 logger = get_logger(__name__)
@@ -57,47 +55,34 @@ def main(cfg: DictConfig) -> None:
     inner_cfg = InnerLoopConfig(
         max_iterations=int(cfg.inner_loop.max_iterations),
         num_solver_samples=int(cfg.inner_loop.num_solver_samples),
-        qa_per_chunk=int(cfg.inner_loop.qa_per_chunk),
         parallel_solvers=bool(cfg.inner_loop.get("parallel_solvers", True)),
     )
 
-    accepted_qas: list[dict[str, Any]] = []
     all_rounds_path = out_dir / "rounds.jsonl"
     accepted_path = out_dir / "accepted_qa.jsonl"
     summary_path = out_dir / "summary.json"
 
-    n_chunks = 0
+    n_done = 0
     n_accepted = 0
     n_rounds = 0
     t_start = time.time()
 
-    chunks_per_paper = cfg.inner_loop.get("chunks_per_paper", None)
-    chunk_concurrency = int(cfg.run.get("chunk_concurrency", 1))
+    paper_concurrency = int(cfg.run.get("paper_concurrency", 1))
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from threading import Lock
     write_lock = Lock()
 
     with all_rounds_path.open("w") as f_rounds, accepted_path.open("w") as f_acc:
         papers = list(iter_papers(cfg.paths.papers_dir, limit=cfg.run.papers_limit))
+        logger.info("processing %d papers (concurrency=%d)", len(papers), paper_concurrency)
 
-        all_chunks = []
-        for paper in papers:
-            cks = chunk_paper(paper, max_chars=int(cfg.inner_loop.max_chunk_chars))
-            if chunks_per_paper is not None:
-                cks = cks[:int(chunks_per_paper)]
-            all_chunks.extend(cks)
-        logger.info("processing %d papers -> %d chunks (concurrency=%d)",
-                    len(papers), len(all_chunks), chunk_concurrency)
-
-        def _write_one(chunk, qa, rounds):
+        def _write_one(paper, qa, rounds):
             nonlocal n_rounds, n_accepted
             with write_lock:
                 for r in rounds:
                     n_rounds += 1
                     f_rounds.write(json.dumps({
-                        "paper_id": chunk.paper_id,
-                        "chunk_id": chunk.chunk_id,
-                        "section": chunk.section,
+                        "paper_id": paper.paper_id,
                         **r.__dict__,
                     }, default=str, ensure_ascii=False) + "\n")
                     f_rounds.flush()
@@ -106,48 +91,44 @@ def main(cfg: DictConfig) -> None:
                     f_acc.write(json.dumps(qa.model_dump(), ensure_ascii=False) + "\n")
                     f_acc.flush()
 
-        with ThreadPoolExecutor(max_workers=chunk_concurrency) as pool:
-            futures = {pool.submit(run_inner_loop_for_chunk, ck, clients, criteria, inner_cfg): ck
-                       for ck in all_chunks}
+        with ThreadPoolExecutor(max_workers=paper_concurrency) as pool:
+            futures = {pool.submit(run_inner_loop_for_paper, p, clients, criteria, inner_cfg): p
+                       for p in papers}
             for fut in as_completed(futures):
-                chunk = futures[fut]
-                n_chunks += 1
+                paper = futures[fut]
+                n_done += 1
                 try:
                     qa, rounds = fut.result()
                 except Exception as e:
-                    logger.exception("chunk %s (paper=%s) crashed: %s",
-                                     chunk.chunk_id, chunk.paper_id, e)
+                    logger.exception("paper %s crashed: %s", paper.paper_id, e)
                     # Persist a failure marker so the run summary reflects it.
                     with write_lock:
                         f_rounds.write(json.dumps({
-                            "paper_id": chunk.paper_id,
-                            "chunk_id": chunk.chunk_id,
-                            "section": chunk.section,
+                            "paper_id": paper.paper_id,
                             "error": f"{type(e).__name__}: {e}",
                             "accepted": False,
                         }, ensure_ascii=False) + "\n")
                         f_rounds.flush()
                     continue
-                _write_one(chunk, qa, rounds)
-                if n_chunks % 5 == 0 or qa is not None:
-                    logger.info("progress: %d/%d chunks, %d accepted (%.1f%%)",
-                                n_chunks, len(all_chunks), n_accepted,
-                                100 * n_accepted / max(n_chunks, 1))
+                _write_one(paper, qa, rounds)
+                if n_done % 5 == 0 or qa is not None:
+                    logger.info("progress: %d/%d papers, %d accepted (%.1f%%)",
+                                n_done, len(papers), n_accepted,
+                                100 * n_accepted / max(n_done, 1))
 
     elapsed = time.time() - t_start
     write_json(summary_path, {
         "run_id": cfg.run_id,
         "papers": len(papers),
-        "chunks": n_chunks,
         "rounds": n_rounds,
         "accepted_qas": n_accepted,
         "elapsed_s": elapsed,
-        "yield_per_chunk": n_accepted / max(n_chunks, 1),
-        "rounds_per_chunk": n_rounds / max(n_chunks, 1),
+        "yield_per_paper": n_accepted / max(n_done, 1),
+        "rounds_per_paper": n_rounds / max(n_done, 1),
     })
-    logger.info("DONE: chunks=%d rounds=%d accepted=%d (%.1f%%) elapsed=%.1fs",
-                n_chunks, n_rounds, n_accepted,
-                100 * n_accepted / max(n_chunks, 1), elapsed)
+    logger.info("DONE: papers=%d rounds=%d accepted=%d (%.1f%%) elapsed=%.1fs",
+                n_done, n_rounds, n_accepted,
+                100 * n_accepted / max(n_done, 1), elapsed)
 
 
 if __name__ == "__main__":

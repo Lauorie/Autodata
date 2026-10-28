@@ -41,13 +41,11 @@ def _load_qas(path: Path, n: int) -> list:
 
 def _generate(model, tokenizer, qa, max_new_tokens: int = 384) -> str:
     import torch
+
+    from autodata.llm import prompts
     msgs = [
-        {"role": "system",
-         "content": "You are a research assistant answering a question about a CS paper passage. "
-                    "Read the passage carefully, then provide a precise answer that addresses every "
-                    "aspect of the question. Reply ONLY with the answer text."},
-        {"role": "user",
-         "content": f"PASSAGE:\n\"\"\"\n{qa.context}\n\"\"\"\n\nQUESTION: {qa.question}\n\nANSWER:"},
+        {"role": "system", "content": prompts.SOLVER_SYSTEM},
+        {"role": "user", "content": prompts.solver_user(qa.context, qa.question)},
     ]
     prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -72,7 +70,7 @@ def main() -> int:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from autodata.config_runtime import build_role_clients_from_yaml
-    from autodata.pipeline.evaluate_rubric import _ask_judge, weighted_average
+    from autodata.pipeline.evaluate_rubric import _ask_judge, rubric_score
 
     qas = _load_qas(Path(args.eval_jsonl), args.max_eval)
     logger.info("evaluating on %d QAs", len(qas))
@@ -92,9 +90,8 @@ def main() -> int:
     logger.info("scoring base model...")
     for i, qa in enumerate(qas):
         ans = _generate(base, tok, qa)
-        weights = [c.weight for c in qa.rubric.criteria]
         per, _fb = _ask_judge(judge, qa, ans)
-        score = float(weighted_average(per, weights))
+        score = rubric_score(per, qa.rubric.weights)
         base_scores.append(score)
         rows.append({"i": i, "q": qa.question[:120], "base_answer": ans[:300],
                      "base_score": score})
@@ -114,9 +111,8 @@ def main() -> int:
     ft_scores: list[float] = []
     for i, qa in enumerate(qas):
         ans = _generate(finetuned, tok, qa)
-        weights = [c.weight for c in qa.rubric.criteria]
         per, _fb = _ask_judge(judge, qa, ans)
-        score = float(weighted_average(per, weights))
+        score = rubric_score(per, qa.rubric.weights)
         ft_scores.append(score)
         rows[i]["ft_answer"] = ans[:300]
         rows[i]["ft_score"] = score

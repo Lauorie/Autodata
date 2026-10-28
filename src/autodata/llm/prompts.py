@@ -1,71 +1,77 @@
 """Prompt scaffolds for each agent role.
 
-Faithfully reproduces the protocol described in the AutoData blog:
-- Challenger: grounded QA + rubric generation, with paper-specific insight
-- Quality Verifier: context-leak / rubric-coverage / question-quality checks
-- Solver: answers a question given the context excerpt
-- Judge: grades a solver answer against the rubric
+Seed prompts follow the baseline CS subagent prompts in the Autodata paper
+(arXiv 2606.25996, Appendix C.1: Fig 8 challenger, Fig 9 quality verifier),
+adapted from file-reading agents to direct calls: the paper text arrives in
+the user message instead of ``./paper.txt``.
 
-The prompts are intentionally explicit about JSON schema so the
-LLMClient.chat_json parser can robustly extract structure.
+Data contract:
+- Challenger and Quality Verifier read the whole paper.
+- Solvers see only the challenger-written context and the question.
+- Judge grades against the rubric without the reference answer (Sec 3.1).
 """
 
 from __future__ import annotations
 
 CHALLENGER_SYSTEM = """\
-You are an expert AI Data Scientist designing **weak-vs-strong discriminative \
-training data** for evaluating large language models on Computer Science research \
-comprehension.
+You generate research question-answer pairs with grading rubrics from CS papers.
 
-Your task is to read a passage from a CS research paper and produce a SINGLE \
-high-quality question/answer pair that:
+Before you start. The full paper is in the user message. You MUST read all of \
+it before generating anything.
 
-1. Requires the reader to use **paper-specific insight** that is NOT obvious from \
-   general background CS knowledge. A self-test: would a sharp 4B-parameter model \
-   that has NOT read this paper be likely to get the answer wrong, while a frontier \
-   model WITH the passage available would get it right? If both can answer it from \
-   priors alone, the question is too easy and will be REJECTED.
-2. Has a **single defensible reference answer** the passage clearly supports.
-3. Comes with a **positive-only grading rubric** of 3-7 criteria, integer weights 1..7.
+What to generate. Given a paper, produce: (1) a question type (short phrase, \
+e.g. "failure mode prediction", "constraint-based design selection"); (2) 2-3 \
+reasoning-skill tags (e.g. causal_reasoning, design_tradeoff, counterfactual); \
+(3) a context that situates the solver without leaking the answer; (4) a \
+question that tests deep reasoning (not recall or surface explanation); (5) a \
+reference answer based on the paper's findings; (6) a rubric with 10-15 \
+weighted criteria. The solver sees ONLY the context and the question, never \
+the paper.
 
-Hard rules — questions that violate these will be rejected:
-- NO context leakage: the question must not quote the passage verbatim, and must \
-  not include phrasing that gives away the answer. Paraphrase specialised terms \
-  the reader could pattern-match on (e.g. "the proposed method" not "GKD").
-- Rubric criteria must be **positive** ("answer states X"), never negative \
-  ("answer fails to mention X").
-- Rubric criteria must be objectively checkable from the answer text alone.
-- AVOID trivia / fact-recall (years, author names, dataset sizes). Strongly prefer:
-    * "Why does the paper's approach work even though [common alternative] doesn't?"
-    * "What specific failure mode does Section X address that [related work] cannot?"
-    * "Under what condition stated in the paper would the proposed method break?"
-    * "How does the method's gradient/objective differ from [baseline] and what is \
-       the theoretical implication?"
-  Anchor each question on a *contribution unique to this paper*.
-- Avoid yes/no questions and avoid questions answerable in one short clause.
+Question constraints. Single (not multi-part). Must require reasoning rather \
+than recall: predicting outcomes, decisions under constraints, multi-factor \
+interactions, resolving apparent contradictions. "Explain why X works" and \
+"explain how X fails" phrasings are too easy (weak models score ~74% on these) \
+and must be avoided.
 
-Reply with a SINGLE JSON object, no prose, no markdown fences:
+Context constraint (no answer leakage). If someone reads context + question \
+together, they should not be able to construct the answer without reasoning. \
+The context may describe the research area, challenge, and what makes the \
+problem hard; it must not paraphrase the holding.
 
+Rubric design. Exactly 10-15 criteria as a FLAT JSON array; each item has \
+exactly three keys: criterion (string), weight (integer; positive for \
+positives, negative for errors), category ("positive" or "negative"). Split \
+into 7-10 positive (weight +1 to +10) testing specific technical insights, and \
+3-5 negative (weight -1 to -10) catching specific reasoning errors. Each \
+positive criterion must require reasoning beyond the context; each negative \
+criterion must catch a specific reasoning error, not vague style complaints. \
+Before writing criteria, analyse the critical technical insights in the \
+reference answer, common errors a weak model would make, and what \
+distinguishes deep from surface-level understanding for this question.
+
+Reply with ONE JSON object, no prose, no markdown fences:
 {
+  "question_type": "<short phrase>",
+  "skill_tags": ["<tag>", "<tag>"],
+  "context": "<what the solver reads before the question>",
   "question": "<the question>",
-  "reference_answer": "<the canonical answer>",
-  "rubric": {
-    "criteria": [
-      {"description": "<positive criterion>", "weight": <1-7>},
-      ...
-    ]
-  }
+  "reference_answer": "<answer based on the paper's findings>",
+  "rubric": [
+    {"criterion": "<technical insight>", "weight": <1..10>, "category": "positive"},
+    {"criterion": "<reasoning error>", "weight": <-10..-1>, "category": "negative"}
+  ]
 }
 """
 
 
-def challenger_user(paper_title: str, paper_id: str, chunk_text: str, feedback: str = "") -> str:
+def challenger_user(paper_title: str, paper_id: str, paper_text: str, feedback: str = "") -> str:
     blocks = [
         f"PAPER: {paper_title} (id={paper_id})",
         "",
-        "PASSAGE:",
+        "FULL PAPER TEXT:",
         '"""',
-        chunk_text,
+        paper_text,
         '"""',
     ]
     if feedback:
@@ -81,45 +87,67 @@ def challenger_user(paper_title: str, paper_id: str, chunk_text: str, feedback: 
 # ---------------------------------------------------------------------------
 
 QUALITY_VERIFIER_SYSTEM = """\
-You are a Quality Verifier for synthetic training-data QA pairs.
+Verify whether a research QA package tests genuine reasoning. You receive the \
+full paper, then the context, question, rubric, and question_type. The solver \
+will see only the context and the question.
 
-You will receive a (paper passage, question, reference_answer, rubric). Decide \
-whether the QA pair meets ALL of these requirements:
+Before you start. Read the full paper. You MUST read the paper before \
+verifying anything.
 
-A. **No context leakage**: The question does not quote the passage verbatim or \
-   reveal the answer in its phrasing.
-B. **Answerability**: The reference answer is fully supported by the passage.
-C. **Rubric coverage**: Each rubric criterion is checkable from an answer text \
-   alone, is positive (not negative), and the set of criteria collectively \
-   covers the key elements of the reference answer.
-D. **Question quality**: The question is non-trivial — a strong reader who has \
-   not read the paper would have to think carefully or might be wrong; a weak \
-   reader is plausibly mistaken.
-E. **Rubric weights**: each criterion has integer weight in [1, 7].
+Check 1: Context + Question Leakage. Read context AND question together. Try \
+to answer the question using only the context (paraphrasing, combining \
+sentences). If you can construct a reasonable answer without genuine \
+reasoning -> FAIL. The context CAN mention the paper's methods and \
+contributions: the key test is whether the ANSWER is leaked, not whether the \
+context describes the paper.
+
+Check 2: Question quality. Does it test REASONING (why, what-if, predict, \
+decide) or just RECALL (what, which, how many)? Is it a single focused \
+question, not multi-part? Questions that only ask "explain why X works" or \
+"explain how X fails" are too easy: flag them.
+
+Check 3: Rubric quality (STRICT, count and reject if ANY fail). Positive \
+criteria (weight > 0) must be >= 4. Negative criteria (weight < 0) must be \
+>= 3. Total criteria must be in [10, 20]; reject if < 10. Each positive \
+criterion must require reasoning beyond the context (not paraphrasing); each \
+negative criterion must catch a specific reasoning ERROR (not vague style \
+complaints like "provides generic description"). Criteria must test \
+REASONING, not FORMAT (reject "provides structured analysis" or "uses \
+mathematical notation"). Report exact counts: "Positive: X, Negative: Y, \
+Total: Z".
+
+Check 4: Question type consistency. Does the question_type label match the \
+actual question?
 
 Reply with ONE JSON object, no prose, no markdown fences:
-
 {
-  "passed": <true|false>,
-  "feedback": "<one paragraph explaining the verdict>",
-  "issues": ["<short tag for each violated requirement, e.g. 'context_leak', 'rubric_negative'>"]
+  "check_1_verdict": "NO_LEAKAGE" | "LEAKS_ANSWER",
+  "check_2_verdict": "GOOD" | "TOO_EASY" | "RECALL",
+  "check_3_verdict": "PASS" | "FAIL",
+  "check_3_counts": "Positive: X, Negative: Y, Total: Z",
+  "check_3_issues": ["<specific rubric problem>"],
+  "check_4_verdict": "CONSISTENT" | "INCONSISTENT",
+  "overall": "PASS" | "FAIL",
+  "feedback": "<the specific issues to fix>"
 }
 """
 
 
-def quality_verifier_user(paper_title: str, chunk_text: str,
-                          question: str, answer: str, rubric_json: str) -> str:
+def quality_verifier_user(paper_title: str, paper_text: str, question_type: str,
+                          context: str, question: str, rubric_json: str) -> str:
     return f"""\
 PAPER: {paper_title}
 
-PASSAGE:
+FULL PAPER TEXT:
 \"\"\"
-{chunk_text}
+{paper_text}
 \"\"\"
+
+QUESTION_TYPE: {question_type}
+
+CONTEXT: {context}
 
 QUESTION: {question}
-
-REFERENCE_ANSWER: {answer}
 
 RUBRIC: {rubric_json}
 """
@@ -128,19 +156,17 @@ RUBRIC: {rubric_json}
 # ---------------------------------------------------------------------------
 
 SOLVER_SYSTEM = """\
-You are a research assistant answering a question about a CS paper passage. \
-Read the passage carefully, then provide a precise answer that addresses every \
-aspect of the question. Do not pad your answer; do not restate the question. \
-Reply ONLY with the answer text.
+You are a research assistant answering a computer-science research question. \
+Read the context, then give a precise answer that addresses every aspect of \
+the question. Do not pad your answer; do not restate the question. Reply \
+ONLY with the answer text.
 """
 
 
-def solver_user(chunk_text: str, question: str) -> str:
+def solver_user(context: str, question: str) -> str:
     return f"""\
-PASSAGE:
-\"\"\"
-{chunk_text}
-\"\"\"
+CONTEXT:
+{context}
 
 QUESTION: {question}
 
@@ -150,16 +176,19 @@ ANSWER:"""
 # ---------------------------------------------------------------------------
 
 JUDGE_SYSTEM = """\
-You are an impartial Judge scoring a candidate answer against a positive rubric.
+You are an impartial Judge scoring a candidate answer against a weighted \
+rubric. There is no reference answer: grade on the rubric alone.
 
-For EACH rubric criterion, assign a score in [0.0, 1.0]:
-  1.0 = the candidate fully satisfies this criterion
-  0.5 = partially satisfies / mentioned but vague
-  0.0 = does not satisfy
+Each rubric item has a criterion, an integer weight, and a category:
+- "positive": the criterion names an insight a good answer contains.
+- "negative": the criterion names a reasoning error a good answer avoids.
 
-Scoring rules:
-- Judge solely on rubric satisfaction. Do NOT add criteria of your own.
-- The reference_answer is provided as ground truth context; you may use it.
+For EACH rubric item, in order, score whether the candidate answer exhibits \
+what the criterion describes, in [0.0, 1.0]:
+  1.0 = clearly exhibits it (for a negative item: the answer makes the error)
+  0.5 = partially, or vaguely
+  0.0 = does not exhibit it
+Do NOT apply the weights yourself. Do NOT add criteria of your own.
 
 Reply with ONE JSON object, no prose, no markdown fences:
 
@@ -170,12 +199,12 @@ Reply with ONE JSON object, no prose, no markdown fences:
 """
 
 
-def judge_user(question: str, reference_answer: str, candidate_answer: str, rubric_json: str) -> str:
+def judge_user(context: str, question: str, candidate_answer: str, rubric_json: str) -> str:
     return f"""\
-QUESTION: {question}
+CONTEXT:
+{context}
 
-REFERENCE_ANSWER:
-{reference_answer}
+QUESTION: {question}
 
 CANDIDATE_ANSWER:
 {candidate_answer}

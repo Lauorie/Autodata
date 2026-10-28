@@ -24,8 +24,8 @@ from autodata.config_runtime import (
     build_client_pool,
     role_configs_from_dictconfig,
 )
-from autodata.llm import LLMClient, QAPair
-from autodata.pipeline.evaluate_rubric import _ask_judge
+from autodata.llm import LLMClient, QAPair, prompts
+from autodata.pipeline.evaluate_rubric import _ask_judge, rubric_score
 from autodata.utils import set_seed, setup_logging
 
 logger = logging.getLogger(__name__)
@@ -45,13 +45,7 @@ def _load_dataset(jsonl_path: str | Path) -> list[QAPair]:
 
 
 def _build_prompt(qa: QAPair) -> str:
-    return (
-        "PASSAGE:\n\"\"\"\n"
-        f"{qa.context}\n"
-        "\"\"\"\n\n"
-        f"QUESTION: {qa.question}\n\n"
-        "ANSWER:"
-    )
+    return prompts.solver_user(qa.context, qa.question)
 
 
 def _make_reward_fn(qas: list[QAPair], judge: LLMClient):
@@ -63,9 +57,7 @@ def _make_reward_fn(qas: list[QAPair], judge: LLMClient):
     id rather than the rendered prompt string — prompt strings can be
     truncated, padded, or re-formatted by the trainer and are unsafe keys.
     """
-    qa_by_id: dict[str, QAPair] = {f"{q.paper_id}::{q.chunk_id}::{i}": q
-                                   for i, q in enumerate(qas)}
-    from autodata.pipeline.evaluate_rubric import weighted_average
+    qa_by_id: dict[str, QAPair] = {f"{q.paper_id}::{i}": q for i, q in enumerate(qas)}
 
     def reward_fn(prompts: list[str], completions: list[str], **kwargs):
         qa_ids = kwargs.get("qa_id") or []
@@ -83,9 +75,8 @@ def _make_reward_fn(qas: list[QAPair], judge: LLMClient):
                 qa = qa_by_id.get(qid)
                 if qa is None:
                     return 0.0
-                weights = [cr.weight for cr in qa.rubric.criteria]
                 per, _fb = _ask_judge(judge, qa, c)
-                return float(weighted_average(per, weights))
+                return rubric_score(per, qa.rubric.weights)
             futures = [pool.submit(_grade, qid, c)
                        for qid, c in zip(qa_ids, completions, strict=False)]
             return [f.result() for f in futures]
@@ -112,7 +103,7 @@ def main(cfg: DictConfig) -> None:
         raise SystemExit(f"no QA pairs in {qa_jsonl}")
 
     prompts = [_build_prompt(q) for q in qas]
-    qa_ids = [f"{q.paper_id}::{q.chunk_id}::{i}" for i, q in enumerate(qas)]
+    qa_ids = [f"{q.paper_id}::{i}" for i, q in enumerate(qas)]
     ds = Dataset.from_dict({"prompt": prompts, "qa_id": qa_ids})
 
     role_configs = role_configs_from_dictconfig(cfg.models)

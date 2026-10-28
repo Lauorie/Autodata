@@ -20,21 +20,26 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from ..llm import LLMClient, QAPair, SolverScore
-from ..llm import prompts as _prompts_module    # late-bound
+from ..llm import prompts as _prompts_module  # late-bound
 from ..llm.client import extract_json
 
 logger = logging.getLogger(__name__)
 
 
-def weighted_average(per_criterion: Sequence[float], weights: Sequence[int]) -> float:
-    if not per_criterion:
-        return 0.0
+def rubric_score(per_criterion: Sequence[float], weights: Sequence[int]) -> float:
+    """Signed-weight rubric score in [0, 1].
+
+    Positive items add ``w * s``, negative items (``w < 0``) subtract when the
+    answer makes the error. The sum is divided by the positive-weight total
+    and clipped at 0: the clipped PRBench form the paper reports (Table 4).
+    """
     if len(per_criterion) != len(weights):
-        # Truncate / pad-with-zeros to length-match. We treat missing scores as 0.
-        n = min(len(per_criterion), len(weights))
-        per_criterion = list(per_criterion[:n]) + [0.0] * (len(weights) - n)
-    total_w = sum(weights) or 1
-    return sum(s * w for s, w in zip(per_criterion, weights, strict=False)) / total_w
+        raise ValueError(f"{len(per_criterion)} scores for {len(weights)} rubric items")
+    max_score = sum(w for w in weights if w > 0)
+    if max_score == 0:
+        return 0.0
+    raw = sum(s * w for s, w in zip(per_criterion, weights, strict=True))
+    return max(0.0, raw / max_score)
 
 
 def _ask_solver(solver: LLMClient, qa: QAPair) -> str:
@@ -73,11 +78,11 @@ def _normalise_judge_scores(raw_scores: list[float], expected_n: int) -> list[fl
 
 
 def _ask_judge(judge: LLMClient, qa: QAPair, candidate: str) -> tuple[list[float], str]:
-    rubric_json = json.dumps(qa.rubric.model_dump(), ensure_ascii=False)
+    # The judge never sees the reference answer (paper Sec 3.1).
     raw = judge.chat([
         {"role": "system", "content": _prompts_module.JUDGE_SYSTEM},
         {"role": "user", "content": _prompts_module.judge_user(
-            qa.question, qa.reference_answer, candidate, rubric_json)},
+            qa.context, qa.question, candidate, qa.rubric.to_prompt_json())},
     ])
     n_crit = len(qa.rubric.criteria)
     try:
@@ -108,7 +113,7 @@ def _score_one(solver: LLMClient, judge: LLMClient,
     return SolverScore(
         answer=ans,
         per_criterion=per,
-        weighted_score=weighted_average(per, weights),
+        weighted_score=rubric_score(per, weights),
         judge_feedback=fb,
     )
 
@@ -126,7 +131,7 @@ def score_solver(
     ThreadPoolExecutor — this is safe because the proxy backend is just an
     HTTP client and the local HF backend serializes generation internally.
     """
-    weights = [c.weight for c in qa.rubric.criteria]
+    weights = qa.rubric.weights
     if not parallel or n_samples <= 1:
         return [_score_one(solver, judge, qa, weights, i) for i in range(n_samples)]
     from concurrent.futures import ThreadPoolExecutor
@@ -190,4 +195,4 @@ if __name__ == "__main__":
     raise SystemExit(_cli())
 
 
-__all__ = ["score_solver", "weighted_average"]
+__all__ = ["rubric_score", "score_solver"]

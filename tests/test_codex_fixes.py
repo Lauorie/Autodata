@@ -5,74 +5,66 @@ Each test pins a single behaviour the corresponding fix introduces.
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
-
 import pytest
 
-from autodata.data_module.chunker import Chunk
-from autodata.llm import LLMClient
-from autodata.llm.client import LLMRoleConfig
 from autodata.llm.schemas import QAPair, RubricCriterion, RubricSpec
 from autodata.pipeline.acceptance import AcceptanceCriteria
 from autodata.pipeline.evaluate_rubric import _normalise_judge_scores
 from autodata.pipeline.inner_loop import (
     InnerLoopConfig,
     _qv_step,
-    run_inner_loop_for_chunk,
+    run_inner_loop_for_paper,
 )
-
+from tests.fakes import ScriptedBackend, challenger_payload, make_clients, make_paper, qv_payload
 
 # ---------------------------------------------------------------------------
-# Codex MAJOR #4: Verifier strict-bool coercion
+# Codex MAJOR #4: Verifier verdict parsing must fail closed
 # ---------------------------------------------------------------------------
-
-@dataclass
-class _CannedBackend:
-    response: str
-
-    def chat(self, role_cfg, messages):
-        return self.response
-
 
 def _qa_for_qv() -> QAPair:
     return QAPair(
-        question="q?", context="ctx", reference_answer="a",
-        rubric=RubricSpec(criteria=[RubricCriterion(description="answer mentions key concept", weight=1)]),
-        paper_id="p", chunk_id="p::0::0",
+        question_type="failure mode prediction", skill_tags=["causal_reasoning"],
+        context="ctx", question="q?", reference_answer="a",
+        rubric=RubricSpec(criteria=[RubricCriterion(
+            criterion="answer mentions key concept", weight=1, category="positive")]),
+        paper_id="p",
     )
 
 
 @pytest.mark.parametrize("payload, expected", [
-    ('{"passed": true}', True),
-    ('{"passed": false}', False),
-    ('{"passed": "false"}', False),       # bool("false") would be True; must NOT be
-    ('{"passed": "no"}', False),
-    ('{"passed": "true"}', True),
-    ('{"passed": 0}', False),
-    ('{"passed": 1}', True),
-    ('{}', False),                         # missing -> False
-    # Fail-closed cases that must NOT be coerced to True:
-    ('{"passed": "ok"}', False),
-    ('{"passed": "maybe"}', False),
-    ('{"passed": 2}', False),               # nonzero non-1 number
-    ('{"passed": -1}', False),
-    ('{"passed": null}', False),
-    ('{"passed": ["yes"]}', False),
+    (qv_payload("PASS"), True),
+    (qv_payload("pass"), True),                                  # case-insensitive
+    (qv_payload(" PASS "), True),
+    (qv_payload("FAIL"), False),
+    # OVERALL says PASS but a check failed: inconsistent verdict -> fail closed.
+    (qv_payload("PASS", check_1_verdict="LEAKS_ANSWER"), False),
+    (qv_payload("PASS", check_2_verdict="RECALL"), False),
+    (qv_payload("PASS", check_2_verdict="TOO_EASY"), False),
+    (qv_payload("PASS", check_3_verdict="FAIL"), False),
+    (qv_payload("PASS", check_4_verdict="INCONSISTENT"), False),
+    (qv_payload("PASS", check_3_verdict=None), False),           # missing check
+    (qv_payload("yes"), False),                                  # not the contract
+    (qv_payload("true"), False),
+    ('{"overall": "PASS"}', False),                              # checks absent
+    ('{}', False),
 ])
-def test_qv_strict_bool(payload: str, expected: bool) -> None:
-    cli = LLMClient(
-        LLMRoleConfig(role="quality_verifier", endpoint="proxy", model="x"),
-        _CannedBackend(response=payload),
-    )
-    chunk = Chunk(paper_id="p", title="t", section="s",
-                  text="x" * 800, chunk_id="p::0::0")
-    verdict = _qv_step(cli, chunk, _qa_for_qv())
+def test_qv_verdict_fails_closed(payload: str, expected: bool) -> None:
+    backend = ScriptedBackend(handlers={"quality_verifier": [payload]})
+    verdict = _qv_step(make_clients(backend)["quality_verifier"], make_paper(), _qa_for_qv())
     assert verdict.passed is expected
 
 
+def test_qv_failure_lists_failed_checks() -> None:
+    payload = qv_payload("FAIL", check_1_verdict="LEAKS_ANSWER", check_3_verdict="FAIL")
+    backend = ScriptedBackend(handlers={"quality_verifier": [payload]})
+    verdict = _qv_step(make_clients(backend)["quality_verifier"], make_paper(), _qa_for_qv())
+    assert "check_1_verdict=LEAKS_ANSWER" in verdict.issues
+    assert "check_3_verdict=FAIL" in verdict.issues
+    assert not any(i.startswith("check_2") for i in verdict.issues)
+
+
 # ---------------------------------------------------------------------------
-# Codex MAJOR #5: Judge scores must be clamped + length-aligned BEFORE weighted_average
+# Codex MAJOR #5: Judge scores must be clamped + length-aligned BEFORE rubric_score
 # ---------------------------------------------------------------------------
 
 def test_normalise_clamps_minor_overshoot() -> None:
@@ -124,37 +116,13 @@ def test_inner_loop_uses_late_bound_prompts(monkeypatch) -> None:
     """
     from autodata.llm import prompts as base_prompts
 
-    captured: list[str] = []
-
-    @dataclass
-    class _CaptureBackend:
-        def chat(self, role_cfg, messages):
-            for m in messages:
-                if m["role"] == "system":
-                    captured.append(m["content"])
-            # Return a minimal valid challenger payload so the loop progresses.
-            if role_cfg.role == "challenger":
-                return json.dumps({
-                    "question": "q?", "reference_answer": "a",
-                    "rubric": {"criteria": [{"description": "d", "weight": 1}]},
-                })
-            if role_cfg.role == "quality_verifier":
-                return json.dumps({"passed": False, "feedback": "stop", "issues": []})
-            return ""
-
-    cli = lambda role: LLMClient(
-        LLMRoleConfig(role=role, endpoint="proxy", model="x"), _CaptureBackend(),
-    )
-    clients = {r: cli(r) for r in
-               ["challenger", "quality_verifier", "weak_solver", "strong_solver", "judge"]}
-
+    backend = ScriptedBackend(handlers={
+        "challenger": [challenger_payload()],
+        "quality_verifier": [qv_payload("FAIL", check_2_verdict="RECALL")],
+    })
     monkeypatch.setattr(base_prompts, "CHALLENGER_SYSTEM", "MUTATED-CHALLENGER-SYSTEM")
-    chunk = Chunk(paper_id="p", title="t", section="s",
-                  text="x" * 800, chunk_id="p::0::0")
-    run_inner_loop_for_chunk(
-        chunk, clients, AcceptanceCriteria(),
-        InnerLoopConfig(max_iterations=1, num_solver_samples=1,
-                        qa_per_chunk=1, parallel_solvers=False),
+    run_inner_loop_for_paper(
+        make_paper(), make_clients(backend), AcceptanceCriteria(),
+        InnerLoopConfig(max_iterations=1, num_solver_samples=1, parallel_solvers=False),
     )
-    # The challenger must have been called with the *new* system prompt.
-    assert any("MUTATED-CHALLENGER-SYSTEM" in c for c in captured), captured
+    assert "MUTATED-CHALLENGER-SYSTEM" in backend.text_seen_by("challenger")

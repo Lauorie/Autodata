@@ -1,26 +1,6 @@
-"""Tests for rubric scoring + JSON extraction helpers."""
+"""Tests for JSON extraction from model output."""
 
 from autodata.llm.client import extract_json
-from autodata.pipeline.evaluate_rubric import weighted_average
-
-
-def test_weighted_average_uniform() -> None:
-    assert weighted_average([1.0, 0.0], [1, 1]) == 0.5
-
-
-def test_weighted_average_skewed() -> None:
-    # Weights 1, 4 → 0.0*1 + 1.0*4 = 4 / 5 = 0.8
-    assert abs(weighted_average([0.0, 1.0], [1, 4]) - 0.8) < 1e-9
-
-
-def test_weighted_average_pad_with_zeros() -> None:
-    # Judge returned 1 score, rubric has 2 criteria → second treated as 0.
-    out = weighted_average([1.0], [1, 1])
-    assert abs(out - 0.5) < 1e-9
-
-
-def test_weighted_average_empty() -> None:
-    assert weighted_average([], []) == 0.0
 
 
 def test_extract_json_bare() -> None:

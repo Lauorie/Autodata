@@ -1,8 +1,8 @@
 """Inner / evaluation pipeline."""
 
 from .acceptance import AcceptanceCriteria, AcceptanceResult, check_acceptance
-from .evaluate_rubric import score_solver, weighted_average
-from .inner_loop import InnerLoopConfig, RoundRecord, run_inner_loop_for_chunk
+from .evaluate_rubric import rubric_score, score_solver
+from .inner_loop import InnerLoopConfig, RoundRecord, run_inner_loop_for_paper
 
 __all__ = [
     "AcceptanceCriteria",
@@ -10,7 +10,7 @@ __all__ = [
     "InnerLoopConfig",
     "RoundRecord",
     "check_acceptance",
-    "run_inner_loop_for_chunk",
+    "rubric_score",
+    "run_inner_loop_for_paper",
     "score_solver",
-    "weighted_average",
 ]

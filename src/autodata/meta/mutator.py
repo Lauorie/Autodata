@@ -46,7 +46,7 @@ Constraints (hard):
 - Function signatures must be unchanged (same parameter names + order).
 - Maintain the JSON output contracts described in the existing prompts so
   downstream parsers keep working.
-- Stay under 8 KB total.
+- Stay under 16 KB total.
 
 Permitted edits (examples):
 - Tighten / elaborate the Challenger system prompt to push paper-specific reasoning
