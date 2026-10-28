@@ -171,7 +171,9 @@ class _OpenAIBackend:
                 "(see .secrets/remote.env.example)"
             )
         channel = os.environ.get("PROXY_HEADER_X_CHANNEL") if role_cfg.endpoint == "proxy" else None
-        client = OpenAI(api_key=api_key, base_url=base_url, timeout=1800.0,
+        # max_retries=0: `chat` retries transient errors itself; SDK retries on
+        # top would multiply every attempt and retry errors the taxonomy stops.
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=1800.0, max_retries=0,
                         default_headers={"X-Channel": channel} if channel else None)
         flavor = "openrouter" if role_cfg.endpoint == "proxy" else "vllm"
         return cls(client, flavor=flavor, label=role_cfg.base_url_env)

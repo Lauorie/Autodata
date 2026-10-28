@@ -126,6 +126,14 @@ def test_gateway_wrapped_transient_is_retried(upstream: int) -> None:
     assert len(sdk.requests) == 2
 
 
+def test_sdk_does_not_retry_on_its_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    # tenacity is the one retry layer; the SDK's default (2) would multiply it.
+    monkeypatch.setenv("PROXY_BASE_URL", "http://test/v1")
+    monkeypatch.setenv("PROXY_API_KEY", "k")
+    backend = _OpenAIBackend.from_env(_role())
+    assert backend._client.max_retries == 0
+
+
 def test_non_api_exception_propagates_unretried() -> None:
     sdk = _FakeSDK(ValueError("bug in our code"))
     with pytest.raises(ValueError):
