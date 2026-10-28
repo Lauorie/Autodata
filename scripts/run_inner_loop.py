@@ -24,29 +24,24 @@ from dotenv import load_dotenv
 from omegaconf import DictConfig
 
 from autodata.config_runtime import (
+    acceptance_from_dictconfig,
     build_client_pool,
+    inner_loop_from_dictconfig,
     role_configs_from_dictconfig,
 )
 from autodata.data_module import Paper, iter_papers
 from autodata.llm import LLMClient, PromptSet, QAPair, UsageMeter, VerifierVerdict
 from autodata.pipeline.acceptance import AcceptanceCriteria
 from autodata.pipeline.final_filter import RubricShape, final_filter
-from autodata.pipeline.inner_loop import InnerLoopConfig, RoundRecord, run_inner_loop_for_paper
+from autodata.pipeline.inner_loop import (
+    InnerLoopConfig,
+    RoundRecord,
+    run_inner_loop_for_paper,
+    stop_reason,
+)
 from autodata.utils import get_logger, set_seed, setup_logging, write_json
 
 logger = get_logger(__name__)
-
-
-def _criteria_from(cfg: DictConfig) -> AcceptanceCriteria:
-    return AcceptanceCriteria(
-        quality_verifier_must_pass=bool(cfg.quality_verifier_must_pass),
-        weak_avg_max=float(cfg.weak_avg_max),
-        weak_max_max=float(cfg.weak_max_max),
-        no_zeros=bool(cfg.no_zeros),
-        strong_avg_min=float(cfg.strong_avg_min),
-        strong_avg_max=float(cfg.strong_avg_max),
-        gap_min=float(cfg.gap_min),
-    )
 
 
 def _filter_accepted(paper: Paper, qa: QAPair, qv: LLMClient,
@@ -84,13 +79,8 @@ def main(cfg: DictConfig) -> None:
     role_configs = role_configs_from_dictconfig(cfg.models, cfg.solver_generation)
     meter = UsageMeter(out_dir / "usage.jsonl")     # one line per completed call
     clients = build_client_pool(role_configs, meter=meter)
-    criteria = _criteria_from(cfg.acceptance)
-    inner_cfg = InnerLoopConfig(
-        max_iterations=int(cfg.inner_loop.max_iterations),
-        num_solver_samples=int(cfg.inner_loop.num_solver_samples),
-        infra_retries=int(cfg.inner_loop.infra_retries),
-        parallel_solvers=bool(cfg.inner_loop.get("parallel_solvers", True)),
-    )
+    criteria = acceptance_from_dictconfig(cfg.acceptance)
+    inner_cfg = inner_loop_from_dictconfig(cfg.inner_loop)
     shape = RubricShape(**cfg.final_filter)
     prompts = PromptSet.load(cfg.prompts_dir) if cfg.prompts_dir else PromptSet.seed()
     logger.info("prompts: %s", cfg.prompts_dir or "seed")
@@ -106,6 +96,8 @@ def main(cfg: DictConfig) -> None:
     n_final = 0
     n_rounds = 0
     outcomes: Counter[str] = Counter()
+    # Papers stopped by infrastructure or length, not by their questions.
+    stopped: Counter[str] = Counter()
     # Solver samples graded / cut at the token budget (paper App A, Table 8).
     samples: Counter[str] = Counter()
     t_start = time.time()
@@ -134,6 +126,8 @@ def main(cfg: DictConfig) -> None:
                         **r.__dict__,
                     }, default=str, ensure_ascii=False) + "\n")
                     f_rounds.flush()
+                if (reason := stop_reason(rounds)) is not None:
+                    stopped[reason] += 1
                 if qa is None:
                     return
                 n_accepted += 1
@@ -159,6 +153,7 @@ def main(cfg: DictConfig) -> None:
                     logger.exception("paper %s crashed: %s", paper.paper_id, e)
                     # Persist a failure marker so the run summary reflects it.
                     with write_lock:
+                        stopped["crash"] += 1
                         f_rounds.write(json.dumps({
                             "paper_id": paper.paper_id,
                             "error": f"{type(e).__name__}: {e}",
@@ -180,6 +175,7 @@ def main(cfg: DictConfig) -> None:
         "accepted_qas": n_accepted,
         "final_qas": n_final,
         "outcomes": dict(outcomes),
+        "papers_stopped": dict(stopped),
         "weak_truncation_rate": samples["weak_truncated"] / max(samples["weak"], 1),
         "strong_truncation_rate": samples["strong_truncated"] / max(samples["strong"], 1),
         "elapsed_s": elapsed,

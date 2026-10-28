@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,9 @@ import yaml
 
 from .llm import LLMClient
 from .llm.client import LLMRoleConfig, build_client_pool
+from .meta.outer_loop import MetaConfig
+from .pipeline.acceptance import AcceptanceCriteria
+from .pipeline.inner_loop import InnerLoopConfig
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +80,32 @@ def role_configs_from_dictconfig(models: Any, solver_generation: Any) -> dict[st
     return apply_solver_generation(roles, dict(solver_generation))
 
 
+def acceptance_from_dictconfig(c: Any) -> AcceptanceCriteria:
+    return AcceptanceCriteria(
+        quality_verifier_must_pass=bool(c.quality_verifier_must_pass),
+        weak_avg_max=float(c.weak_avg_max),
+        weak_max_max=float(c.weak_max_max),
+        no_zeros=bool(c.no_zeros),
+        strong_avg_min=float(c.strong_avg_min),
+        strong_avg_max=float(c.strong_avg_max),
+        gap_min=float(c.gap_min),
+    )
+
+
+def inner_loop_from_dictconfig(c: Any) -> InnerLoopConfig:
+    return InnerLoopConfig(
+        max_iterations=int(c.max_iterations),
+        num_solver_samples=int(c.num_solver_samples),
+        infra_retries=int(c.infra_retries),
+        parallel_solvers=bool(c.get("parallel_solvers", True)),
+    )
+
+
+def meta_from_dictconfig(c: Any) -> MetaConfig:
+    """Every MetaConfig field must be set in the config: no hidden defaults."""
+    return MetaConfig(**{f.name: c[f.name] for f in fields(MetaConfig)})
+
+
 def build_role_clients_from_yaml(models_path: str | Path,
                                  config_path: str | Path) -> dict[str, LLMClient]:
     return build_client_pool(role_configs_from_yaml(models_path, config_path))
@@ -84,8 +113,11 @@ def build_role_clients_from_yaml(models_path: str | Path,
 
 __all__ = [
     "SOLVER_ROLES",
+    "acceptance_from_dictconfig",
     "apply_solver_generation",
     "build_role_clients_from_yaml",
+    "inner_loop_from_dictconfig",
+    "meta_from_dictconfig",
     "role_configs_from_dictconfig",
     "role_configs_from_yaml",
 ]

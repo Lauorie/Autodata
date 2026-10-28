@@ -92,8 +92,14 @@ class PaperTooLongError(RuntimeError):
 
 
 # Outcomes that stop the paper: retrying them, or asking for a new question,
-# would fail the same way.
-_STOPS_PAPER = frozenset({"infra_error", "paper_too_long", "error"})
+# would fail the same way. None of them says anything about the question.
+STOP_OUTCOMES = frozenset({"infra_error", "paper_too_long", "error"})
+
+
+def stop_reason(rounds: list[RoundRecord]) -> str | None:
+    """The outcome that stopped the paper early, or None."""
+    last = rounds[-1].outcome if rounds else None
+    return last if last in STOP_OUTCOMES else None
 
 
 def _describe_validation_error(e: ValidationError) -> str:
@@ -270,10 +276,17 @@ def run_inner_loop_for_paper(
         logger.info("[%s it=%d] %s %s", paper.paper_id, it, rec.outcome, reasons)
         if rec.accepted:
             return qa, rounds
-        if rec.outcome in _STOPS_PAPER:
+        if rec.outcome in STOP_OUTCOMES:
             break
 
     return None, rounds
 
 
-__all__ = ["InnerLoopConfig", "MalformedOutputError", "RoundRecord", "run_inner_loop_for_paper"]
+__all__ = [
+    "STOP_OUTCOMES",
+    "InnerLoopConfig",
+    "MalformedOutputError",
+    "RoundRecord",
+    "run_inner_loop_for_paper",
+    "stop_reason",
+]

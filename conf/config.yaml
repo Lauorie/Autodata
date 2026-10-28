@@ -47,10 +47,24 @@ run:
   concurrency: 4
   paper_concurrency: 4     # how many papers to process in parallel
 
+# Meta-optimization of the challenger and verifier prompts (Sec 4).
 meta:
-  n_generations: 4
-  temperature: 0.1
-  validation_papers: 8
+  iterations: 4             # the paper ran 233; each costs 1 train + 2 validation evaluations
+  temperature: 0.1          # Boltzmann parent selection
+  train_papers: 50
+  val_papers: 25
+  train_minibatch: 5        # papers per analysis; the paper gives no number
+  val_samples_per_paper: 4  # 25 papers -> the paper's 100 validation samples
+  # Rounds per session. The paper scores "the fraction of generated QA pairs"
+  # that pass, so 1 scores each pair on its own. More rounds score whole
+  # inner-loop runs, which near 1.0 at the 15-round budget (gate: 5/5) and
+  # stop telling variants apart. At 1, challenger_refine is never exercised.
+  session_rounds: 1
+  answer_chars: 1500        # each solver answer shown to the analyzer is cut here
+  min_scored_fraction: 0.8  # fewer scored sessions (infra stops) void the evaluation
+  max_prompt_chars: 20000   # cap on the four mutable prompts together
+  edit_retries: 2           # re-asks of the implementer after an unusable reply
+  workers: 4                # sessions in parallel within one evaluation
 
 train:
   # Defaults sized for 2× A800-80GB. Halve only if OOM.

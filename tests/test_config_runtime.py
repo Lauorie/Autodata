@@ -9,8 +9,14 @@ from pathlib import Path
 import pytest
 from hydra import compose, initialize_config_dir
 
-from autodata.config_runtime import role_configs_from_dictconfig, role_configs_from_yaml
+from autodata.config_runtime import (
+    acceptance_from_dictconfig,
+    meta_from_dictconfig,
+    role_configs_from_dictconfig,
+    role_configs_from_yaml,
+)
 from autodata.llm import LLMRoleConfig
+from autodata.pipeline.acceptance import AcceptanceCriteria
 
 CONF = Path(__file__).resolve().parents[1] / "conf"
 SOLVERS = ("weak_solver", "strong_solver")
@@ -96,3 +102,23 @@ def test_flash_solvers_still_share_the_generation_block() -> None:
     weak, strong = roles["weak_solver"], roles["strong_solver"]
     for field in ("thinking", "max_tokens", "temperature", "top_p", "top_k", "presence_penalty"):
         assert getattr(weak, field) == getattr(strong, field), field
+
+
+# -- the rest of the run config -------------------------------------------------
+
+def _compose(*overrides: str):
+    with initialize_config_dir(config_dir=str(CONF), version_base=None):
+        return compose(config_name="config", overrides=["run_id=t", *overrides])
+
+
+def test_shipped_acceptance_is_fig7() -> None:
+    # AcceptanceCriteria's defaults are the Fig 7 numbers.
+    assert acceptance_from_dictconfig(_compose().acceptance) == AcceptanceCriteria()
+
+
+def test_shipped_meta_config_follows_sec4() -> None:
+    cfg = _compose()
+    meta = meta_from_dictconfig(cfg.meta)
+    assert meta.temperature == 0.1                          # Boltzmann T
+    assert (cfg.meta.train_papers, cfg.meta.val_papers) == (50, 25)
+    assert meta.val_samples_per_paper * cfg.meta.val_papers == 100   # "100 validation samples"
