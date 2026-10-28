@@ -48,7 +48,6 @@ final_filter:
 
 run:
   papers_limit: null
-  concurrency: 4
   paper_concurrency: 4     # how many papers to process in parallel
 
 # Training and test data (Sec 3.1): final questions of finished runs,

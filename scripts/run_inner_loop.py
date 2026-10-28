@@ -102,7 +102,7 @@ def main(cfg: DictConfig) -> None:
     samples: Counter[str] = Counter()
     t_start = time.time()
 
-    paper_concurrency = int(cfg.run.get("paper_concurrency", 1))
+    paper_concurrency = int(cfg.run.paper_concurrency)
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from threading import Lock
     write_lock = Lock()
