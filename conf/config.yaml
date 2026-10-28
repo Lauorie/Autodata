@@ -47,6 +47,12 @@ run:
   concurrency: 4
   paper_concurrency: 4     # how many papers to process in parallel
 
+# Training and test data (Sec 3.1): final questions of finished runs,
+# split by paper. scripts/build_dataset.py.
+data:
+  runs: []                  # run directories whose final_qa.jsonl to read
+  test_size: 100            # held out per data source, as in the paper
+
 # Meta-optimization of the challenger and verifier prompts (Sec 4).
 meta:
   iterations: 4             # the paper ran 233; each costs 1 train + 2 validation evaluations
