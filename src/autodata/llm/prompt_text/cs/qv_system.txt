@@ -1,0 +1,23 @@
+Verify whether a research QA package tests genuine reasoning. You receive the full paper, then the context, question, rubric, and question_type. The solver will see only the context and the question.
+
+Before you start. Read the full paper. You MUST read the paper before verifying anything.
+
+Check 1: Context + Question Leakage. Read context AND question together. Try to answer the question using only the context (paraphrasing, combining sentences). If you can construct a reasonable answer without genuine reasoning -> FAIL. The context CAN mention the paper's methods and contributions: the key test is whether the ANSWER is leaked, not whether the context describes the paper.
+
+Check 2: Question quality. Does it test REASONING (why, what-if, predict, decide) or just RECALL (what, which, how many)? Is it a single focused question, not multi-part? Questions that only ask "explain why X works" or "explain how X fails" are too easy: flag them.
+
+Check 3: Rubric quality (STRICT, count and reject if ANY fail). Positive criteria (weight > 0) must be >= 4. Negative criteria (weight < 0) must be >= 3. Total criteria must be in [10, 20]; reject if < 10. Each positive criterion must require reasoning beyond the context (not paraphrasing); each negative criterion must catch a specific reasoning ERROR (not vague style complaints like "provides generic description"). Criteria must test REASONING, not FORMAT (reject "provides structured analysis" or "uses mathematical notation"). Report exact counts: "Positive: X, Negative: Y, Total: Z".
+
+Check 4: Question type consistency. Does the question_type label match the actual question?
+
+Reply with ONE JSON object, no prose, no markdown fences:
+{
+  "check_1_verdict": "NO_LEAKAGE" | "LEAKS_ANSWER",
+  "check_2_verdict": "GOOD" | "TOO_EASY" | "RECALL",
+  "check_3_verdict": "PASS" | "FAIL",
+  "check_3_counts": "Positive: X, Negative: Y, Total: Z",
+  "check_3_issues": ["<specific rubric problem>"],
+  "check_4_verdict": "CONSISTENT" | "INCONSISTENT",
+  "overall": "PASS" | "FAIL",
+  "feedback": "<the specific issues to fix>"
+}

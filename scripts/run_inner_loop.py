@@ -28,7 +28,7 @@ from autodata.config_runtime import (
     role_configs_from_dictconfig,
 )
 from autodata.data_module import Paper, iter_papers
-from autodata.llm import LLMClient, QAPair, UsageMeter, VerifierVerdict
+from autodata.llm import LLMClient, PromptSet, QAPair, UsageMeter, VerifierVerdict
 from autodata.pipeline.acceptance import AcceptanceCriteria
 from autodata.pipeline.final_filter import RubricShape, final_filter
 from autodata.pipeline.inner_loop import InnerLoopConfig, RoundRecord, run_inner_loop_for_paper
@@ -62,9 +62,9 @@ def _filter_accepted(paper: Paper, qa: QAPair, qv: LLMClient,
 
 
 def _process(paper: Paper, clients: dict[str, LLMClient], criteria: AcceptanceCriteria,
-             inner_cfg: InnerLoopConfig, shape: RubricShape,
+             inner_cfg: InnerLoopConfig, shape: RubricShape, prompts: PromptSet,
              ) -> tuple[QAPair | None, list[RoundRecord], VerifierVerdict | None]:
-    qa, rounds = run_inner_loop_for_paper(paper, clients, criteria, inner_cfg)
+    qa, rounds = run_inner_loop_for_paper(paper, clients, criteria, inner_cfg, prompts)
     verdict = (_filter_accepted(paper, qa, clients["quality_verifier"], shape,
                                 inner_cfg.infra_retries)
                if qa is not None else None)
@@ -92,6 +92,8 @@ def main(cfg: DictConfig) -> None:
         parallel_solvers=bool(cfg.inner_loop.get("parallel_solvers", True)),
     )
     shape = RubricShape(**cfg.final_filter)
+    prompts = PromptSet.load(cfg.prompts_dir) if cfg.prompts_dir else PromptSet.seed()
+    logger.info("prompts: %s", cfg.prompts_dir or "seed")
 
     all_rounds_path = out_dir / "rounds.jsonl"
     accepted_path = out_dir / "accepted_qa.jsonl"
@@ -146,7 +148,7 @@ def main(cfg: DictConfig) -> None:
                     f_final.flush()
 
         with ThreadPoolExecutor(max_workers=paper_concurrency) as pool:
-            futures = {pool.submit(_process, p, clients, criteria, inner_cfg, shape): p
+            futures = {pool.submit(_process, p, clients, criteria, inner_cfg, shape, prompts): p
                        for p in papers}
             for fut in as_completed(futures):
                 paper = futures[fut]
@@ -172,6 +174,7 @@ def main(cfg: DictConfig) -> None:
     elapsed = time.time() - t_start
     write_json(summary_path, {
         "run_id": cfg.run_id,
+        "prompts_dir": cfg.prompts_dir,
         "papers": len(papers),
         "rounds": n_rounds,
         "accepted_qas": n_accepted,

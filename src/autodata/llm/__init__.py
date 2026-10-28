@@ -8,6 +8,7 @@ from .errors import (
     PermanentLLMError,
     TransientLLMError,
 )
+from .prompt_set import PromptSet
 from .schemas import QAPair, RubricCriterion, RubricSpec, SolverScore, VerifierVerdict
 from .usage import UsageMeter
 
@@ -18,6 +19,7 @@ __all__ = [
     "LLMRoleConfig",
     "OutputTruncatedError",
     "PermanentLLMError",
+    "PromptSet",
     "QAPair",
     "RubricCriterion",
     "RubricSpec",

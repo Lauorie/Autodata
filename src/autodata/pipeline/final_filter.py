@@ -11,8 +11,9 @@ does two things and fails closed:
    source alike.
 2. One more quality-verifier call (Fig 9).
 
-There is no "short context" threshold: the paper gives none. The filter runs
-outside meta-optimization, so the verifier call sees the seed prompts.
+There is no "short context" threshold: the paper gives none. The verifier
+call always uses the seed prompts, whatever set the loop ran with: the
+filter is a fixed gate, outside meta-optimization.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from dataclasses import dataclass
 
 from ..data_module import Paper
 from ..llm import LLMClient, QAPair, RubricSpec, VerifierVerdict
+from ..llm.prompt_set import PromptSet
 from .quality_verifier import VerifierOutputError, verify_quality
 
 
@@ -55,7 +57,7 @@ def final_filter(paper: Paper, qa: QAPair, qv: LLMClient, shape: RubricShape,
         return VerifierVerdict(passed=False, feedback="rubric fails Fig 9 check 3 counts",
                                issues=issues)
     try:
-        return verify_quality(qv, paper, qa, retries)
+        return verify_quality(qv, paper, qa, retries, prompts=PromptSet.seed())
     except VerifierOutputError as e:
         return VerifierVerdict(passed=False, feedback=str(e),
                                issues=["unreadable verifier reply"])

@@ -22,7 +22,7 @@ import hydra
 from dotenv import load_dotenv
 from omegaconf import DictConfig
 
-from autodata.llm import prompts
+from autodata.llm import PromptSet
 from autodata.llm.schemas import QAPair
 from autodata.utils import set_seed, setup_logging
 
@@ -44,8 +44,8 @@ def _load_dataset(jsonl_path: str | Path) -> list[QAPair]:
 def _format_example(qa: QAPair, tok) -> dict[str, str]:
     """Render a chat-template-formatted SFT example."""
     msgs_full = [
-        {"role": "system", "content": prompts.SOLVER_SYSTEM},
-        {"role": "user", "content": prompts.solver_user(qa.context, qa.question)},
+        {"role": "system", "content": PromptSet.seed().solver_system},
+        {"role": "user", "content": PromptSet.seed().render_solver(qa.context, qa.question)},
         {"role": "assistant", "content": qa.reference_answer},
     ]
     text = tok.apply_chat_template(msgs_full, tokenize=False, add_generation_prompt=False)

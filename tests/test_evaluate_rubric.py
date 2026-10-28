@@ -3,6 +3,7 @@
 from autodata.llm import SolverScore
 from autodata.llm.client import extract_json
 from autodata.llm.errors import OutputTruncatedError
+from autodata.llm.prompt_set import PromptSet
 from autodata.pipeline.evaluate_rubric import score_solver
 from tests.fakes import WEAK_PER, Handler, ScriptedBackend, judge_payload, make_clients, make_qa
 
@@ -60,7 +61,8 @@ def _score(solver: Handler, judge: Handler | list[str], n_samples: int = 1,
     backend = ScriptedBackend(handlers={"weak_solver": solver, "judge": judge})
     clients = make_clients(backend)
     scores = score_solver(clients["weak_solver"], clients["judge"], make_qa(),
-                          n_samples=n_samples, parallel=False, retries=retries)
+                          n_samples=n_samples, parallel=False, retries=retries,
+                          prompts=PromptSet.seed())
     return scores, backend
 
 

@@ -36,9 +36,9 @@ from pydantic import ValidationError
 
 from ..data_module import Paper
 from ..llm import LLMClient, QAPair, RubricSpec, SolverScore
-from ..llm import prompts as _prompts_module  # late-bound on every call
 from ..llm.client import extract_json
 from ..llm.errors import ContextLengthError, OutputTruncatedError
+from ..llm.prompt_set import PromptSet
 from .acceptance import AcceptanceCriteria, check_strong, check_weak
 from .evaluate_rubric import score_solver
 from .feedback import FailedAttempt, render_history, snippet
@@ -102,11 +102,12 @@ def _describe_validation_error(e: ValidationError) -> str:
     )
 
 
-def _challenger_step(challenger: LLMClient, paper: Paper, feedback: str) -> QAPair:
+def _challenger_step(challenger: LLMClient, paper: Paper, feedback: str,
+                     prompts: PromptSet) -> QAPair:
     try:
         raw = challenger.chat([
-            {"role": "system", "content": _prompts_module.CHALLENGER_SYSTEM},
-            {"role": "user", "content": _prompts_module.challenger_user(
+            {"role": "system", "content": prompts.challenger_system},
+            {"role": "user", "content": prompts.render_challenger(
                 paper.title, paper.paper_id, paper.text, feedback)},
         ])
     except ContextLengthError as e:
@@ -148,11 +149,12 @@ def _truncation_note(samples: list[SolverScore], solver: str) -> str:
 
 def _evaluate(qa: QAPair, paper: Paper, clients: dict[str, LLMClient],
               criteria: AcceptanceCriteria, cfg: InnerLoopConfig,
-              rec: RoundRecord) -> FailedAttempt | None:
+              rec: RoundRecord, prompts: PromptSet) -> FailedAttempt | None:
     """Fig 7 steps 2-8 for one question. Fills ``rec``; returns the history
     entry when the question failed on its merits, else None."""
     try:
-        verdict = verify_quality(clients["quality_verifier"], paper, qa, cfg.infra_retries)
+        verdict = verify_quality(clients["quality_verifier"], paper, qa, cfg.infra_retries,
+                                 prompts=prompts)
     except ContextLengthError as e:
         raise PaperTooLongError(f"quality verifier: {e}") from e
     rec.qv_verdict = verdict.model_dump()
@@ -164,7 +166,8 @@ def _evaluate(qa: QAPair, paper: Paper, clients: dict[str, LLMClient],
                              f"verifier: {snippet(verdict.feedback)}")
 
     weak = score_solver(clients["weak_solver"], clients["judge"], qa,
-                        cfg.num_solver_samples, cfg.parallel_solvers, cfg.infra_retries)
+                        cfg.num_solver_samples, cfg.parallel_solvers, cfg.infra_retries,
+                        prompts=prompts)
     rec.weak_samples = [s.model_dump() for s in weak]
     if (err := _first_infra_error(weak)) is not None:
         rec.outcome, rec.error = "infra_error", f"weak solver: {err}"
@@ -182,7 +185,8 @@ def _evaluate(qa: QAPair, paper: Paper, clients: dict[str, LLMClient],
                              f"judge: {snippet(best.judge_feedback)}")
 
     strong = score_solver(clients["strong_solver"], clients["judge"], qa,
-                          cfg.num_solver_samples, cfg.parallel_solvers, cfg.infra_retries)
+                          cfg.num_solver_samples, cfg.parallel_solvers, cfg.infra_retries,
+                          prompts=prompts)
     rec.strong_samples = [s.model_dump() for s in strong]
     if (err := _first_infra_error(strong)) is not None:
         rec.outcome, rec.error = "infra_error", f"strong solver: {err}"
@@ -215,11 +219,14 @@ def run_inner_loop_for_paper(
     clients: dict[str, LLMClient],
     criteria: AcceptanceCriteria,
     cfg: InnerLoopConfig,
+    prompts: PromptSet | None = None,
 ) -> tuple[QAPair | None, list[RoundRecord]]:
     """Run the Agentic Self-Instruct loop on one paper.
 
-    Returns (accepted_QA_or_None, list_of_round_records).
+    ``prompts`` defaults to the seed set. Returns (accepted_QA_or_None,
+    list_of_round_records).
     """
+    prompts = prompts or PromptSet.seed()
     history: list[FailedAttempt] = []
     malformed_note = ""
     rounds: list[RoundRecord] = []
@@ -230,9 +237,9 @@ def run_inner_loop_for_paper(
         feedback = _compose_feedback(history, malformed_note)
         malformed_note = ""
         try:
-            qa = _challenger_step(clients["challenger"], paper, feedback)
+            qa = _challenger_step(clients["challenger"], paper, feedback, prompts)
             rec.qa = qa.model_dump()
-            failure = _evaluate(qa, paper, clients, criteria, cfg, rec)
+            failure = _evaluate(qa, paper, clients, criteria, cfg, rec, prompts)
         except MalformedOutputError as e:
             # The challenger broke the output contract (bad JSON, weight 0,
             # sign/category mismatch). Burn one round and say what was wrong.

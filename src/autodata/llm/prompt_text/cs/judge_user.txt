@@ -1,0 +1,9 @@
+CONTEXT:
+$context
+
+QUESTION: $question
+
+CANDIDATE_ANSWER:
+$candidate_answer
+
+RUBRIC: $rubric_json

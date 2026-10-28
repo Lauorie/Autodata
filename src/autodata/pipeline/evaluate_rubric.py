@@ -20,9 +20,9 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from ..llm import LLMClient, QAPair, SolverScore
-from ..llm import prompts as _prompts_module  # late-bound
 from ..llm.client import extract_json
 from ..llm.errors import OutputTruncatedError
+from ..llm.prompt_set import PromptSet
 
 logger = logging.getLogger(__name__)
 
@@ -43,13 +43,13 @@ def rubric_score(per_criterion: Sequence[float], weights: Sequence[int]) -> floa
     return max(0.0, raw / max_score)
 
 
-def _ask_solver(solver: LLMClient, qa: QAPair) -> tuple[str, bool]:
+def _ask_solver(solver: LLMClient, qa: QAPair, prompts: PromptSet) -> tuple[str, bool]:
     """Return ``(answer, truncated)``. A reply cut at the token budget is the
     model's own failure (paper App A): keep whatever answer it reached."""
     try:
         return solver.chat([
-            {"role": "system", "content": _prompts_module.SOLVER_SYSTEM},
-            {"role": "user", "content": _prompts_module.solver_user(qa.context, qa.question)},
+            {"role": "system", "content": prompts.solver_system},
+            {"role": "user", "content": prompts.render_solver(qa.context, qa.question)},
         ]), False
     except OutputTruncatedError as e:
         return e.partial, True
@@ -94,7 +94,7 @@ def _parse_judge(raw: str, n_crit: int) -> tuple[list[float], str]:
 
 
 def judge_answer(judge: LLMClient, qa: QAPair, candidate: str,
-                 retries: int = 0) -> tuple[list[float], str]:
+                 retries: int = 0, *, prompts: PromptSet) -> tuple[list[float], str]:
     """Grade one answer; re-ask up to ``retries`` times, naming the problem.
 
     The judge never sees the reference answer (paper Sec 3.1). A reply cut
@@ -102,8 +102,8 @@ def judge_answer(judge: LLMClient, qa: QAPair, candidate: str,
     """
     n_crit = len(qa.rubric.criteria)
     base = [
-        {"role": "system", "content": _prompts_module.JUDGE_SYSTEM},
-        {"role": "user", "content": _prompts_module.judge_user(
+        {"role": "system", "content": prompts.judge_system},
+        {"role": "user", "content": prompts.render_judge(
             qa.context, qa.question, candidate, qa.rubric.to_prompt_json())},
     ]
     messages = base
@@ -136,11 +136,11 @@ def _infra_failure(answer: str, n_crit: int, reason: str) -> SolverScore:
 
 
 def _score_one(solver: LLMClient, judge: LLMClient, qa: QAPair,
-               weights: list[int], idx: int, retries: int) -> SolverScore:
+               weights: list[int], idx: int, retries: int, prompts: PromptSet) -> SolverScore:
     # Fig 7: SOLVER_ERROR or an empty response is an infrastructure failure,
     # flagged so the loop never reads it as a low score.
     try:
-        ans, truncated = _ask_solver(solver, qa)
+        ans, truncated = _ask_solver(solver, qa, prompts)
     except Exception as e:
         logger.warning("solver call failed sample %d: %s", idx, e)
         return _infra_failure(f"ERROR: {e}", len(weights), _SOLVER_ERROR)
@@ -151,7 +151,7 @@ def _score_one(solver: LLMClient, judge: LLMClient, qa: QAPair,
                                truncated=True)
         return _infra_failure(ans, len(weights), f"{_SOLVER_ERROR}: empty response")
     try:
-        per, fb = judge_answer(judge, qa, ans, retries)
+        per, fb = judge_answer(judge, qa, ans, retries, prompts=prompts)
     except JudgeOutputError as e:
         return _infra_failure(ans, len(weights), f"PARSE_FAIL: {e}")
     return SolverScore(
@@ -164,13 +164,14 @@ def _score_one(solver: LLMClient, judge: LLMClient, qa: QAPair,
 
 
 def _run_samples(solver: LLMClient, judge: LLMClient, qa: QAPair, idxs: list[int],
-                 parallel: bool, retries: int) -> list[SolverScore]:
+                 parallel: bool, retries: int, prompts: PromptSet) -> list[SolverScore]:
     weights = qa.rubric.weights
     if not parallel or len(idxs) <= 1:
-        return [_score_one(solver, judge, qa, weights, i, retries) for i in idxs]
+        return [_score_one(solver, judge, qa, weights, i, retries, prompts) for i in idxs]
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=len(idxs)) as pool:
-        futures = [pool.submit(_score_one, solver, judge, qa, weights, i, retries) for i in idxs]
+        futures = [pool.submit(_score_one, solver, judge, qa, weights, i, retries, prompts)
+                   for i in idxs]
         return [f.result() for f in futures]
 
 
@@ -181,6 +182,8 @@ def score_solver(
     n_samples: int = 3,
     parallel: bool = True,
     retries: int = 0,
+    *,
+    prompts: PromptSet,
 ) -> list[SolverScore]:
     """Run `n_samples` solver attempts and grade each with the judge.
 
@@ -193,14 +196,14 @@ def score_solver(
     ThreadPoolExecutor: the remote backends are HTTP clients, and the local
     HF backend serializes generation internally.
     """
-    scores = _run_samples(solver, judge, qa, list(range(n_samples)), parallel, retries)
+    scores = _run_samples(solver, judge, qa, list(range(n_samples)), parallel, retries, prompts)
     for _ in range(retries):
         failed = [i for i, s in enumerate(scores)
                   if s.infra_error and s.judge_feedback.startswith(_SOLVER_ERROR)]
         if not failed:
             break
-        for i, s in zip(failed, _run_samples(solver, judge, qa, failed, parallel, retries),
-                        strict=True):
+        rerun = _run_samples(solver, judge, qa, failed, parallel, retries, prompts)
+        for i, s in zip(failed, rerun, strict=True):
             scores[i] = s
     return scores
 
@@ -226,6 +229,7 @@ def _cli() -> int:
 
     clients = build_role_clients_from_yaml(args.models_yaml, args.config_yaml)
     judge = clients["judge"]
+    prompts = PromptSet.seed()
 
     qa_records = json.loads(Path(args.eval_input).read_text())
     if isinstance(qa_records, dict):
@@ -235,11 +239,13 @@ def _cli() -> int:
     for rec in qa_records:
         qa = QAPair.model_validate(rec)
         if not args.strong_only:
-            weak_samples = score_solver(clients["weak_solver"], judge, qa, args.n_samples)
+            weak_samples = score_solver(clients["weak_solver"], judge, qa, args.n_samples,
+                                        prompts=prompts)
         else:
             weak_samples = []
         if not args.weak_only:
-            strong_samples = score_solver(clients["strong_solver"], judge, qa, args.n_samples)
+            strong_samples = score_solver(clients["strong_solver"], judge, qa, args.n_samples,
+                                          prompts=prompts)
         else:
             strong_samples = []
         results.append({

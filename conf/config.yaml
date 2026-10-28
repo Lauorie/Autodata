@@ -5,6 +5,10 @@ defaults:
 
 run_id: ???
 seed: 42
+# Prompt directory for the challenger, verifier, solvers and judge. null is
+# the seed CS set (src/autodata/llm/prompt_text/cs); a meta-optimization
+# variant directory works too.
+prompts_dir: null
 
 paths:
   papers_dir: /root/autodl-fs/autodata/papers-mds

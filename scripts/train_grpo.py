@@ -24,7 +24,7 @@ from autodata.config_runtime import (
     build_client_pool,
     role_configs_from_dictconfig,
 )
-from autodata.llm import LLMClient, QAPair, prompts
+from autodata.llm import LLMClient, PromptSet, QAPair
 from autodata.pipeline.evaluate_rubric import JudgeOutputError, judge_answer, rubric_score
 from autodata.utils import set_seed, setup_logging
 
@@ -45,7 +45,7 @@ def _load_dataset(jsonl_path: str | Path) -> list[QAPair]:
 
 
 def _build_prompt(qa: QAPair) -> str:
-    return prompts.solver_user(qa.context, qa.question)
+    return PromptSet.seed().render_solver(qa.context, qa.question)
 
 
 def _make_reward_fn(qas: list[QAPair], judge: LLMClient):
@@ -76,7 +76,8 @@ def _make_reward_fn(qas: list[QAPair], judge: LLMClient):
                 if qa is None:
                     return 0.0
                 try:
-                    per, _fb = judge_answer(judge, qa, c, retries=2)
+                    per, _fb = judge_answer(judge, qa, c, retries=2,
+                                             prompts=PromptSet.seed())
                 except JudgeOutputError as e:
                     # Scores 0, which charges the judge's failure to the completion.
                     logger.warning("judge unusable for %s: %s", qid, e)

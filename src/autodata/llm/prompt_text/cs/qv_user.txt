@@ -1,0 +1,14 @@
+PAPER: $paper_title
+
+FULL PAPER TEXT:
+"""
+$paper_text
+"""
+
+QUESTION_TYPE: $question_type
+
+CONTEXT: $context
+
+QUESTION: $question
+
+RUBRIC: $rubric_json

@@ -6,9 +6,9 @@ from typing import Any
 
 from ..data_module import Paper
 from ..llm import LLMClient, QAPair, VerifierVerdict
-from ..llm import prompts as _prompts_module  # late-bound on every call
 from ..llm.client import extract_json
 from ..llm.errors import OutputTruncatedError
+from ..llm.prompt_set import PromptSet
 
 
 class VerifierOutputError(ValueError):
@@ -28,13 +28,14 @@ def _verdict_token(value: Any) -> str:
     return value.strip().upper() if isinstance(value, str) else ""
 
 
-def _ask_verdict(qv: LLMClient, paper: Paper, qa: QAPair, retries: int) -> dict[str, Any]:
+def _ask_verdict(qv: LLMClient, paper: Paper, qa: QAPair, retries: int,
+                 prompts: PromptSet) -> dict[str, Any]:
     """Get a JSON verdict object, re-asking up to ``retries`` times with the
     problem named. A reply cut at ``max_tokens`` is not re-asked: the same
     prompt hits the same cap."""
     base = [
-        {"role": "system", "content": _prompts_module.QUALITY_VERIFIER_SYSTEM},
-        {"role": "user", "content": _prompts_module.quality_verifier_user(
+        {"role": "system", "content": prompts.qv_system},
+        {"role": "user", "content": prompts.render_qv(
             paper.title, paper.text, qa.question_type, qa.context, qa.question,
             qa.rubric.to_prompt_json())},
     ]
@@ -60,8 +61,9 @@ def _ask_verdict(qv: LLMClient, paper: Paper, qa: QAPair, retries: int) -> dict[
     raise VerifierOutputError(f"no usable verdict after {retries + 1} attempts: {problem}")
 
 
-def verify_quality(qv: LLMClient, paper: Paper, qa: QAPair, retries: int = 0) -> VerifierVerdict:
-    obj = _ask_verdict(qv, paper, qa, retries)
+def verify_quality(qv: LLMClient, paper: Paper, qa: QAPair, retries: int = 0, *,
+                   prompts: PromptSet) -> VerifierVerdict:
+    obj = _ask_verdict(qv, paper, qa, retries, prompts)
     # Fail closed: the package passes only when OVERALL is PASS *and* every
     # check holds its passing value. A malformed or self-contradicting verdict
     # must never let a bad QA pair through the gate.

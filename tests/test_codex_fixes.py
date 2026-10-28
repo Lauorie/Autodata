@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import pytest
 
+from autodata.llm.prompt_set import PromptSet
 from autodata.llm.schemas import QAPair, RubricCriterion, RubricSpec
 from autodata.pipeline.acceptance import AcceptanceCriteria
 from autodata.pipeline.evaluate_rubric import _normalise_judge_scores
@@ -47,14 +48,16 @@ def _qa_for_qv() -> QAPair:
 ])
 def test_qv_verdict_fails_closed(payload: str, expected: bool) -> None:
     backend = ScriptedBackend(handlers={"quality_verifier": [payload]})
-    verdict = verify_quality(make_clients(backend)["quality_verifier"], make_paper(), _qa_for_qv())
+    verdict = verify_quality(make_clients(backend)["quality_verifier"], make_paper(), _qa_for_qv(),
+                             prompts=PromptSet.seed())
     assert verdict.passed is expected
 
 
 def test_qv_failure_lists_failed_checks() -> None:
     payload = qv_payload("FAIL", check_1_verdict="LEAKS_ANSWER", check_3_verdict="FAIL")
     backend = ScriptedBackend(handlers={"quality_verifier": [payload]})
-    verdict = verify_quality(make_clients(backend)["quality_verifier"], make_paper(), _qa_for_qv())
+    verdict = verify_quality(make_clients(backend)["quality_verifier"], make_paper(), _qa_for_qv(),
+                             prompts=PromptSet.seed())
     assert "check_1_verdict=LEAKS_ANSWER" in verdict.issues
     assert "check_3_verdict=FAIL" in verdict.issues
     assert not any(i.startswith("check_2") for i in verdict.issues)
@@ -90,24 +93,21 @@ def test_normalise_rejects_unusable_scores(raw: list) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Codex MAJOR #1: Inner loop must dereference prompts via the prompts module
-# (so a hot-swap in meta-optimization actually takes effect).
+# Meta-optimization swaps prompt sets: the loop must use the set it is given,
+# with no global state to patch.
 # ---------------------------------------------------------------------------
 
-def test_inner_loop_uses_late_bound_prompts(monkeypatch) -> None:
-    """When `autodata.llm.prompts.CHALLENGER_SYSTEM` is monkeypatched at
-    runtime, the inner loop should pick up the new value rather than a
-    snapshot taken at import time. This is the silent-meta bug from codex.
-    """
-    from autodata.llm import prompts as base_prompts
-
+def test_inner_loop_uses_the_prompt_set_it_is_given() -> None:
     backend = ScriptedBackend(handlers={
         "challenger": [challenger_payload()],
         "quality_verifier": [qv_payload("FAIL", check_2_verdict="RECALL")],
     })
-    monkeypatch.setattr(base_prompts, "CHALLENGER_SYSTEM", "MUTATED-CHALLENGER-SYSTEM")
+    variant = PromptSet.seed().evolve(challenger_system="VARIANT-CHALLENGER",
+                                      qv_system="VARIANT-VERIFIER")
     run_inner_loop_for_paper(
         make_paper(), make_clients(backend), AcceptanceCriteria(),
         InnerLoopConfig(max_iterations=1, num_solver_samples=1, parallel_solvers=False),
+        variant,
     )
-    assert "MUTATED-CHALLENGER-SYSTEM" in backend.text_seen_by("challenger")
+    assert "VARIANT-CHALLENGER" in backend.text_seen_by("challenger")
+    assert "VARIANT-VERIFIER" in backend.text_seen_by("quality_verifier")

@@ -42,10 +42,11 @@ def _load_qas(path: Path, n: int) -> list:
 def _generate(model, tokenizer, qa, max_new_tokens: int = 384) -> str:
     import torch
 
-    from autodata.llm import prompts
+    from autodata.llm import PromptSet
+    prompts = PromptSet.seed()
     msgs = [
-        {"role": "system", "content": prompts.SOLVER_SYSTEM},
-        {"role": "user", "content": prompts.solver_user(qa.context, qa.question)},
+        {"role": "system", "content": prompts.solver_system},
+        {"role": "user", "content": prompts.render_solver(qa.context, qa.question)},
     ]
     prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -71,6 +72,7 @@ def main() -> int:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from autodata.config_runtime import build_role_clients_from_yaml
+    from autodata.llm import PromptSet
     from autodata.pipeline.evaluate_rubric import judge_answer, rubric_score
 
     qas = _load_qas(Path(args.eval_jsonl), args.max_eval)
@@ -91,7 +93,7 @@ def main() -> int:
     logger.info("scoring base model...")
     for i, qa in enumerate(qas):
         ans = _generate(base, tok, qa)
-        per, _fb = judge_answer(judge, qa, ans, retries=2)
+        per, _fb = judge_answer(judge, qa, ans, retries=2, prompts=PromptSet.seed())
         score = rubric_score(per, qa.rubric.weights)
         base_scores.append(score)
         rows.append({"i": i, "q": qa.question[:120], "base_answer": ans[:300],
@@ -112,7 +114,7 @@ def main() -> int:
     ft_scores: list[float] = []
     for i, qa in enumerate(qas):
         ans = _generate(finetuned, tok, qa)
-        per, _fb = judge_answer(judge, qa, ans, retries=2)
+        per, _fb = judge_answer(judge, qa, ans, retries=2, prompts=PromptSet.seed())
         score = rubric_score(per, qa.rubric.weights)
         ft_scores.append(score)
         rows[i]["ft_answer"] = ans[:300]
