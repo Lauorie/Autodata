@@ -29,6 +29,11 @@ train = [
     "bitsandbytes>=0.43",
     "datasets>=2.20",
 ]
+corpus = [
+    "httpx",
+    "beautifulsoup4>=4.12",
+    "markdownify>=0.13",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.4",
