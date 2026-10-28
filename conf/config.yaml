@@ -16,6 +16,20 @@ inner_loop:
   # with a tail past 10 (Sec 3.1.1). 15 covers that tail.
   max_iterations: 15
   num_solver_samples: 3
+  # Fig 7: an infrastructure failure re-runs the eval of the same question.
+  # After this many re-runs (or judge/verifier re-asks) the paper stops.
+  infra_retries: 2
+
+# One generation setting for both solvers, applied in code to weak and strong.
+# GRPO rollouts and evaluation (step 6) must read these same values: the weak
+# solver's budget decides which questions the loop accepts.
+solver_generation:
+  thinking: true            # Qwen3.5 thinks by default; the paper treats the 4B as a reasoning model
+  max_tokens: 65536         # thinking + answer; paper App A reasoning budget for Qwen3.5-4B
+  temperature: 1.0          # paper Sec 4: solvers run at temperature 1.0
+  top_p: 0.95               # Qwen3.5 model card, thinking mode, general tasks
+  top_k: 20
+  presence_penalty: 1.5
 
 # End-of-loop filter: Fig 9 check-3 rubric counts, then one more QV call.
 final_filter:

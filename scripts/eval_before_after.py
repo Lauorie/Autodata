@@ -63,6 +63,7 @@ def main() -> int:
     ap.add_argument("--eval-jsonl", required=True)
     ap.add_argument("--max-eval", type=int, default=10)
     ap.add_argument("--models-yaml", default="conf/models/default.yaml")
+    ap.add_argument("--config-yaml", default="conf/config.yaml")
     args = ap.parse_args()
 
     import torch
@@ -70,12 +71,12 @@ def main() -> int:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from autodata.config_runtime import build_role_clients_from_yaml
-    from autodata.pipeline.evaluate_rubric import _ask_judge, rubric_score
+    from autodata.pipeline.evaluate_rubric import judge_answer, rubric_score
 
     qas = _load_qas(Path(args.eval_jsonl), args.max_eval)
     logger.info("evaluating on %d QAs", len(qas))
 
-    judge = build_role_clients_from_yaml(args.models_yaml)["judge"]
+    judge = build_role_clients_from_yaml(args.models_yaml, args.config_yaml)["judge"]
 
     logger.info("loading base model %s", args.base)
     tok = AutoTokenizer.from_pretrained(args.base, trust_remote_code=True)
@@ -90,7 +91,7 @@ def main() -> int:
     logger.info("scoring base model...")
     for i, qa in enumerate(qas):
         ans = _generate(base, tok, qa)
-        per, _fb = _ask_judge(judge, qa, ans)
+        per, _fb = judge_answer(judge, qa, ans, retries=2)
         score = rubric_score(per, qa.rubric.weights)
         base_scores.append(score)
         rows.append({"i": i, "q": qa.question[:120], "base_answer": ans[:300],
@@ -111,7 +112,7 @@ def main() -> int:
     ft_scores: list[float] = []
     for i, qa in enumerate(qas):
         ans = _generate(finetuned, tok, qa)
-        per, _fb = _ask_judge(judge, qa, ans)
+        per, _fb = judge_answer(judge, qa, ans, retries=2)
         score = rubric_score(per, qa.rubric.weights)
         ft_scores.append(score)
         rows[i]["ft_answer"] = ans[:300]

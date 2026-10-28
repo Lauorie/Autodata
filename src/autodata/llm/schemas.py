@@ -90,6 +90,7 @@ class SolverScore(BaseModel):
     weighted_score: float        # 0..1, signed-weight rubric score
     judge_feedback: str = ""
     infra_error: bool = False    # solver failed or judge output unreadable: not a score
+    truncated: bool = False      # answer cut at the token budget: scored as the model's failure
 
     @field_validator("per_criterion")
     @classmethod

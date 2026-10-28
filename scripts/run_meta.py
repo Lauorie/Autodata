@@ -48,12 +48,13 @@ def main(cfg: DictConfig) -> None:
     out_dir = Path(cfg.paths.outputs_root) / cfg.run_id / "meta"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    role_configs = role_configs_from_dictconfig(cfg.models)
+    role_configs = role_configs_from_dictconfig(cfg.models, cfg.solver_generation)
     clients = build_client_pool(role_configs)
     criteria = _criteria_from(cfg.acceptance)
     inner_cfg = InnerLoopConfig(
         max_iterations=int(cfg.inner_loop.max_iterations),
         num_solver_samples=int(cfg.inner_loop.num_solver_samples),
+        infra_retries=int(cfg.inner_loop.infra_retries),
         parallel_solvers=bool(cfg.inner_loop.get("parallel_solvers", True)),
     )
     n_gen = int(cfg.get("meta", {}).get("n_generations", 4))

@@ -8,10 +8,11 @@ from ..data_module import Paper
 from ..llm import LLMClient, QAPair, VerifierVerdict
 from ..llm import prompts as _prompts_module  # late-bound on every call
 from ..llm.client import extract_json
+from ..llm.errors import OutputTruncatedError
 
 
 class VerifierOutputError(ValueError):
-    """The verifier replied with something that is not a JSON object."""
+    """The verifier never returned a JSON verdict object."""
 
 
 # Fig 9 verdict fields and the value each must take for the package to pass.
@@ -27,19 +28,40 @@ def _verdict_token(value: Any) -> str:
     return value.strip().upper() if isinstance(value, str) else ""
 
 
-def verify_quality(qv: LLMClient, paper: Paper, qa: QAPair) -> VerifierVerdict:
-    raw = qv.chat([
+def _ask_verdict(qv: LLMClient, paper: Paper, qa: QAPair, retries: int) -> dict[str, Any]:
+    """Get a JSON verdict object, re-asking up to ``retries`` times with the
+    problem named. A reply cut at ``max_tokens`` is not re-asked: the same
+    prompt hits the same cap."""
+    base = [
         {"role": "system", "content": _prompts_module.QUALITY_VERIFIER_SYSTEM},
         {"role": "user", "content": _prompts_module.quality_verifier_user(
             paper.title, paper.text, qa.question_type, qa.context, qa.question,
             qa.rubric.to_prompt_json())},
-    ])
-    try:
-        obj = extract_json(raw)
-    except ValueError as e:
-        raise VerifierOutputError(str(e)) from e
-    if not isinstance(obj, dict):
-        raise VerifierOutputError(f"expected a JSON object, got {type(obj).__name__}")
+    ]
+    messages = base
+    for _ in range(retries + 1):
+        try:
+            raw = qv.chat(messages)
+        except OutputTruncatedError as e:
+            raise VerifierOutputError(str(e)) from e
+        try:
+            obj = extract_json(raw)
+        except ValueError as e:
+            problem = f"not JSON: {e}"
+        else:
+            if isinstance(obj, dict):
+                return obj
+            problem = f"expected a JSON object, got {type(obj).__name__}"
+        messages = base + [
+            {"role": "assistant", "content": raw},
+            {"role": "user", "content": f"Your reply could not be used ({problem}). "
+                                        "Reply ONLY with the JSON verdict object."},
+        ]
+    raise VerifierOutputError(f"no usable verdict after {retries + 1} attempts: {problem}")
+
+
+def verify_quality(qv: LLMClient, paper: Paper, qa: QAPair, retries: int = 0) -> VerifierVerdict:
+    obj = _ask_verdict(qv, paper, qa, retries)
     # Fail closed: the package passes only when OVERALL is PASS *and* every
     # check holds its passing value. A malformed or self-contradicting verdict
     # must never let a bad QA pair through the gate.

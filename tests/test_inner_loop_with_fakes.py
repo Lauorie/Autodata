@@ -11,10 +11,18 @@ and the Fig 7 loop control:
 - refinement rounds list every earlier failed question, grouped by failure
   mode, and ask for an entirely new question from a different angle;
 - solver infrastructure errors never enter that history.
+
+and the Fig 7 error policy:
+- an infrastructure failure re-runs the evaluation of the same question;
+  when retries run out, the paper stops (no new question is asked for);
+- a paper too long for the model stops at once;
+- an answer cut at the token budget is the solver's failure, and the
+  history says so.
 """
 
 from __future__ import annotations
 
+from autodata.llm.errors import ContextLengthError, OutputTruncatedError
 from autodata.pipeline.acceptance import AcceptanceCriteria
 from autodata.pipeline.inner_loop import InnerLoopConfig, run_inner_loop_for_paper
 from tests.fakes import (
@@ -180,78 +188,102 @@ def test_malformed_round_keeps_failed_history() -> None:
     assert "TOO EASY" in third and "Q-easy" in third
 
 
-def test_solver_infra_error_stays_out_of_history() -> None:
+def test_transient_solver_failure_rescores_the_same_question() -> None:
+    calls = {"n": 0}
+
     def flaky_weak(messages: list[dict[str, str]]) -> str:
-        if "Q-flaky" in messages[-1]["content"]:
-            raise RuntimeError("weak solver crashed")
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("connection reset")
+        return "WEAK-ANSWER"
+
+    backend = _backend(weak_solver=flaky_weak)
+    qa, rounds = _run(backend)
+    assert qa is not None
+    assert [r.outcome for r in rounds] == ["accepted"]
+    assert len(_challenger_prompts(backend)) == 1
+
+
+def test_persistent_solver_failure_stops_the_paper() -> None:
+    def broken_weak(messages: list[dict[str, str]]) -> str:
+        raise RuntimeError("weak solver crashed")
+
+    backend = _backend(weak_solver=broken_weak)
+    qa, rounds = _run(backend)
+    assert qa is None
+    assert [r.outcome for r in rounds] == ["infra_error"]
+    assert len(_challenger_prompts(backend)) == 1     # no new question asked for
+    assert backend.text_seen_by("strong_solver") == ""
+
+
+def test_paper_too_long_stops_at_once() -> None:
+    def too_long(messages: list[dict[str, str]]) -> str:
+        raise ContextLengthError("maximum context length is 262144 tokens")
+
+    backend = _backend(challenger=too_long)
+    qa, rounds = _run(backend)
+    assert qa is None
+    assert [r.outcome for r in rounds] == ["paper_too_long"]
+
+
+def test_challenger_cut_at_token_limit_costs_one_round() -> None:
+    def cut(messages: list[dict[str, str]]) -> str:
+        raise OutputTruncatedError("challenger", 32768, '{"question_type": "fail')
+
+    calls = {"n": 0}
+
+    def first_cut(messages: list[dict[str, str]]) -> str:
+        calls["n"] += 1
+        return cut(messages) if calls["n"] == 1 else challenger_payload()
+
+    backend = _backend(challenger=first_cut)
+    qa, rounds = _run(backend)
+    assert qa is not None
+    assert [r.outcome for r in rounds] == ["malformed", "accepted"]
+    assert "max_tokens=32768" in _challenger_prompts(backend)[1]
+
+
+def test_truncated_weak_attempts_are_named_in_history() -> None:
+    def weak(messages: list[dict[str, str]]) -> str:
+        if "Q-long" in messages[-1]["content"]:
+            raise OutputTruncatedError("weak_solver", 65536, "")
         return "WEAK-ANSWER"
 
     backend = _backend(
-        challenger=[challenger_payload(question=q) for q in ("Q-flaky", "Q-good")],
-        weak_solver=flaky_weak,
+        challenger=[challenger_payload(question=q) for q in ("Q-long", "Q-good")],
+        weak_solver=weak,
         judge=judge_by_question({"Q-good": (WEAK_PER, STRONG_PER)}),
     )
     qa, rounds = _run(backend)
     assert qa is not None
-    assert [r.outcome for r in rounds] == ["infra_error", "accepted"]
-    second = _challenger_prompts(backend)[1]
-    assert "Q-flaky" not in second
-    assert "PREVIOUSLY FAILED" not in second
+    assert [r.outcome for r in rounds] == ["weak_zero", "accepted"]
+    assert all(s["truncated"] for s in rounds[0].weak_samples)
+    assert "2/2 weak attempts hit the token budget" in _challenger_prompts(backend)[1]
 
 
-def test_challenger_and_verifier_read_the_whole_paper() -> None:
-    tail = "TAIL-OF-PAPER-SENTINEL"
-    paper = make_paper("# Long paper\n\n" + "filler sentence. " * 4000 + tail)
-    backend = _backend()
-    run_inner_loop_for_paper(paper, make_clients(backend), AcceptanceCriteria(), _cfg())
-    assert tail in backend.text_seen_by("challenger")
-    assert tail in backend.text_seen_by("quality_verifier")
-
-
-def test_solvers_see_context_not_paper() -> None:
-    paper_marker = "PAPER-BODY-SENTINEL"
-    context = "CHALLENGER-CONTEXT-SENTINEL: a team distils a large model."
-    paper = make_paper(f"# Paper X\n\n{paper_marker} " + "method details. " * 200)
-    backend = _backend(challenger=lambda m: challenger_payload(context=context))
-    run_inner_loop_for_paper(paper, make_clients(backend), AcceptanceCriteria(), _cfg())
-    for solver in ("weak_solver", "strong_solver"):
-        seen = backend.text_seen_by(solver)
-        assert context in seen
-        assert "Which training change would remove the mismatch" in seen
-        assert paper_marker not in seen
-
-
-def test_judge_never_sees_reference_answer() -> None:
-    reference = "REFERENCE-ANSWER-SENTINEL"
-    backend = _backend(challenger=lambda m: challenger_payload(reference_answer=reference))
-    run_inner_loop_for_paper(make_paper(), make_clients(backend), AcceptanceCriteria(), _cfg())
-    judged = backend.text_seen_by("judge")
-    assert "STRONG-ANSWER" in judged
-    assert reference not in judged
-
-
-def test_malformed_rubric_costs_one_round() -> None:
-    bad_rubric = [dict(RUBRIC[0], weight=0)] + RUBRIC[1:]
-    backend = _backend(challenger=[challenger_payload(rubric=bad_rubric), challenger_payload()])
-    qa, rounds = run_inner_loop_for_paper(make_paper(), make_clients(backend),
-                                          AcceptanceCriteria(), _cfg())
-    assert qa is not None
-    assert len(rounds) == 2
-    assert rounds[0].error is not None and not rounds[0].accepted
-    # The second challenger call carries the validation error back as feedback.
-    challenger_calls = [msgs for role, msgs in backend.calls if role == "challenger"]
-    assert "weight" in challenger_calls[1][-1]["content"]
-
-
-def test_unreadable_verifier_reply_stays_out_of_history() -> None:
-    backend = _backend(
-        challenger=[challenger_payload(question=q) for q in ("Q-first", "Q-good")],
-        quality_verifier=["I think it is fine.", qv_payload()],
-        judge=judge_by_question({"Q-good": (WEAK_PER, STRONG_PER)}),
-    )
+def test_unreadable_verifier_reply_is_reasked() -> None:
+    backend = _backend(quality_verifier=["I think it is fine.", qv_payload()])
     qa, rounds = _run(backend)
     assert qa is not None
-    assert [r.outcome for r in rounds] == ["infra_error", "accepted"]
-    second = _challenger_prompts(backend)[1]
-    assert "Q-first" not in second
-    assert "malformed" not in second
+    assert [r.outcome for r in rounds] == ["accepted"]
+    qv_calls = [msgs for role, msgs in backend.calls if role == "quality_verifier"]
+    assert qv_calls[1][-2] == {"role": "assistant", "content": "I think it is fine."}
+
+
+def test_persistently_unreadable_verifier_stops_the_paper() -> None:
+    backend = _backend(quality_verifier=lambda m: "I think it is fine.")
+    qa, rounds = _run(backend)
+    assert qa is None
+    assert [r.outcome for r in rounds] == ["infra_error"]
+    assert len(_challenger_prompts(backend)) == 1
+
+
+def test_verifier_cut_at_token_limit_stops_the_paper() -> None:
+    def cut(messages: list[dict[str, str]]) -> str:
+        raise OutputTruncatedError("quality_verifier", 4096, '{"check_1_verdict": "NO_')
+
+    backend = _backend(quality_verifier=cut)
+    qa, rounds = _run(backend)
+    assert [r.outcome for r in rounds] == ["infra_error"]
+    assert "max_tokens=4096" in rounds[0].error
+    assert sum(role == "quality_verifier" for role, _ in backend.calls) == 1

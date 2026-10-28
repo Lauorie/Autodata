@@ -48,13 +48,14 @@ def rubric_shape_issues(rubric: RubricSpec, shape: RubricShape) -> list[str]:
     return issues
 
 
-def final_filter(paper: Paper, qa: QAPair, qv: LLMClient, shape: RubricShape) -> VerifierVerdict:
+def final_filter(paper: Paper, qa: QAPair, qv: LLMClient, shape: RubricShape,
+                 retries: int = 0) -> VerifierVerdict:
     issues = rubric_shape_issues(qa.rubric, shape)
     if issues:
         return VerifierVerdict(passed=False, feedback="rubric fails Fig 9 check 3 counts",
                                issues=issues)
     try:
-        return verify_quality(qv, paper, qa)
+        return verify_quality(qv, paper, qa, retries)
     except VerifierOutputError as e:
         return VerifierVerdict(passed=False, feedback=str(e),
                                issues=["unreadable verifier reply"])

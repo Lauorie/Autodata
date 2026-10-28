@@ -25,7 +25,7 @@ from autodata.config_runtime import (
     role_configs_from_dictconfig,
 )
 from autodata.llm import LLMClient, QAPair, prompts
-from autodata.pipeline.evaluate_rubric import _ask_judge, rubric_score
+from autodata.pipeline.evaluate_rubric import JudgeOutputError, judge_answer, rubric_score
 from autodata.utils import set_seed, setup_logging
 
 logger = logging.getLogger(__name__)
@@ -75,7 +75,12 @@ def _make_reward_fn(qas: list[QAPair], judge: LLMClient):
                 qa = qa_by_id.get(qid)
                 if qa is None:
                     return 0.0
-                per, _fb = _ask_judge(judge, qa, c)
+                try:
+                    per, _fb = judge_answer(judge, qa, c, retries=2)
+                except JudgeOutputError as e:
+                    # Scores 0, which charges the judge's failure to the completion.
+                    logger.warning("judge unusable for %s: %s", qid, e)
+                    return 0.0
                 return rubric_score(per, qa.rubric.weights)
             futures = [pool.submit(_grade, qid, c)
                        for qid, c in zip(qa_ids, completions, strict=False)]
@@ -106,7 +111,7 @@ def main(cfg: DictConfig) -> None:
     qa_ids = [f"{q.paper_id}::{i}" for i, q in enumerate(qas)]
     ds = Dataset.from_dict({"prompt": prompts, "qa_id": qa_ids})
 
-    role_configs = role_configs_from_dictconfig(cfg.models)
+    role_configs = role_configs_from_dictconfig(cfg.models, cfg.solver_generation)
     clients = build_client_pool({k: v for k, v in role_configs.items() if k == "judge"})
     judge = clients["judge"]
     reward_fn = _make_reward_fn(qas, judge)

@@ -75,30 +75,18 @@ def test_normalise_clamps_minor_undershoot() -> None:
     assert out == [0.0, 0.0, 0.5]
 
 
-def test_normalise_fail_closed_on_gross_overshoot() -> None:
-    # > 1.25 -> judge confused, treat the whole vector as zero (fail closed)
-    out = _normalise_judge_scores([2.0, 0.5, 0.6], expected_n=3)
-    assert out == [0.0, 0.0, 0.0]
-
-
-def test_normalise_fail_closed_on_gross_undershoot() -> None:
-    out = _normalise_judge_scores([-0.5, 0.5, 0.5], expected_n=3)
-    assert out == [0.0, 0.0, 0.0]
-
-
-def test_normalise_fail_closed_on_garbage() -> None:
-    out = _normalise_judge_scores(["nope", 0.5], expected_n=2)
-    assert out == [0.0, 0.0]
-
-
-def test_normalise_pads_short() -> None:
-    out = _normalise_judge_scores([0.7], expected_n=3)
-    assert out == [0.7, 0.0, 0.0]
-
-
-def test_normalise_truncates_long() -> None:
-    out = _normalise_judge_scores([0.1, 0.2, 0.3, 0.4, 0.5], expected_n=2)
-    assert out == [0.1, 0.2]
+@pytest.mark.parametrize("raw", [
+    [2.0, 0.5, 0.6],          # gross overshoot: judge confused
+    [-0.5, 0.5, 0.5],         # gross undershoot
+    ["nope", 0.5, 0.5],       # not a number
+    [0.7],                    # too few: which item did it skip?
+    [0.1, 0.2, 0.3, 0.4],     # too many
+])
+def test_normalise_rejects_unusable_scores(raw: list) -> None:
+    # Unusable output is a judge failure to re-ask about, never a row of
+    # zeros: zeros would read as "the weak solver failed" (paper Fig 7).
+    with pytest.raises(ValueError):
+        _normalise_judge_scores(raw, expected_n=3)
 
 
 # ---------------------------------------------------------------------------

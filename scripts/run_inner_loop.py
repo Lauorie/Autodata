@@ -5,7 +5,7 @@ Writes, under the run directory:
     accepted_qa.jsonl   questions the loop accepted (the paper's 2.8k stage)
     final_filter.jsonl  end-of-loop filter verdict per accepted question
     final_qa.jsonl      questions that also pass the filter (the 1.3k stage)
-    summary.json        counts, including outcomes per round
+    summary.json        counts: outcomes per round, solver truncation rates
 
 Usage (from repo root, on remote):
     python scripts/run_inner_loop.py run_id=smoke run.papers_limit=5
@@ -50,11 +50,11 @@ def _criteria_from(cfg: DictConfig) -> AcceptanceCriteria:
 
 
 def _filter_accepted(paper: Paper, qa: QAPair, qv: LLMClient,
-                     shape: RubricShape) -> VerifierVerdict:
+                     shape: RubricShape, retries: int) -> VerifierVerdict:
     """End-of-loop filter. A verifier outage fails closed: the question stays
     in accepted_qa.jsonl and can be filtered again later."""
     try:
-        return final_filter(paper, qa, qv, shape)
+        return final_filter(paper, qa, qv, shape, retries)
     except Exception as e:
         logger.exception("final filter failed for %s: %s", paper.paper_id, e)
         return VerifierVerdict(passed=False, feedback=f"{type(e).__name__}: {e}",
@@ -65,7 +65,8 @@ def _process(paper: Paper, clients: dict[str, LLMClient], criteria: AcceptanceCr
              inner_cfg: InnerLoopConfig, shape: RubricShape,
              ) -> tuple[QAPair | None, list[RoundRecord], VerifierVerdict | None]:
     qa, rounds = run_inner_loop_for_paper(paper, clients, criteria, inner_cfg)
-    verdict = (_filter_accepted(paper, qa, clients["quality_verifier"], shape)
+    verdict = (_filter_accepted(paper, qa, clients["quality_verifier"], shape,
+                                inner_cfg.infra_retries)
                if qa is not None else None)
     return qa, rounds, verdict
 
@@ -80,12 +81,13 @@ def main(cfg: DictConfig) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     logger.info("run_id=%s out_dir=%s", cfg.run_id, out_dir)
 
-    role_configs = role_configs_from_dictconfig(cfg.models)
+    role_configs = role_configs_from_dictconfig(cfg.models, cfg.solver_generation)
     clients = build_client_pool(role_configs)
     criteria = _criteria_from(cfg.acceptance)
     inner_cfg = InnerLoopConfig(
         max_iterations=int(cfg.inner_loop.max_iterations),
         num_solver_samples=int(cfg.inner_loop.num_solver_samples),
+        infra_retries=int(cfg.inner_loop.infra_retries),
         parallel_solvers=bool(cfg.inner_loop.get("parallel_solvers", True)),
     )
     shape = RubricShape(**cfg.final_filter)
@@ -101,6 +103,8 @@ def main(cfg: DictConfig) -> None:
     n_final = 0
     n_rounds = 0
     outcomes: Counter[str] = Counter()
+    # Solver samples graded / cut at the token budget (paper App A, Table 8).
+    samples: Counter[str] = Counter()
     t_start = time.time()
 
     paper_concurrency = int(cfg.run.get("paper_concurrency", 1))
@@ -119,6 +123,9 @@ def main(cfg: DictConfig) -> None:
                 for r in rounds:
                     n_rounds += 1
                     outcomes[r.outcome] += 1
+                    for solver, rows in (("weak", r.weak_samples), ("strong", r.strong_samples)):
+                        samples[solver] += len(rows)
+                        samples[f"{solver}_truncated"] += sum(s["truncated"] for s in rows)
                     f_rounds.write(json.dumps({
                         "paper_id": paper.paper_id,
                         **r.__dict__,
@@ -169,6 +176,8 @@ def main(cfg: DictConfig) -> None:
         "accepted_qas": n_accepted,
         "final_qas": n_final,
         "outcomes": dict(outcomes),
+        "weak_truncation_rate": samples["weak_truncated"] / max(samples["weak"], 1),
+        "strong_truncation_rate": samples["strong_truncated"] / max(samples["strong"], 1),
         "elapsed_s": elapsed,
         "yield_per_paper": n_accepted / max(n_done, 1),
         "rounds_per_paper": n_rounds / max(n_done, 1),
