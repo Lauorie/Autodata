@@ -104,6 +104,28 @@ def test_auth_error_is_permanent() -> None:
     assert len(sdk.requests) == 1
 
 
+# The PaperBypass gateway wraps an upstream status in its own 502:
+# {'success': False, 'error': {'message': 'upstream error 400', 'reason': 'upstream_error'}}
+def _gateway_502(upstream: int) -> openai.APIStatusError:
+    body = (f"{{'success': False, 'error': {{'code': 800000047, "
+            f"'message': 'upstream error {upstream}', 'reason': 'upstream_error'}}}}")
+    return _status_error(openai.InternalServerError, 502, body)
+
+
+def test_gateway_wrapped_bad_request_is_permanent() -> None:
+    sdk = _FakeSDK(_gateway_502(400))
+    with pytest.raises(PermanentLLMError):
+        _chat(sdk, _role())
+    assert len(sdk.requests) == 1
+
+
+@pytest.mark.parametrize("upstream", [429, 503])
+def test_gateway_wrapped_transient_is_retried(upstream: int) -> None:
+    sdk = _FakeSDK(_gateway_502(upstream), _reply("ok"))
+    assert _chat(sdk, _role()) == "ok"
+    assert len(sdk.requests) == 2
+
+
 def test_non_api_exception_propagates_unretried() -> None:
     sdk = _FakeSDK(ValueError("bug in our code"))
     with pytest.raises(ValueError):

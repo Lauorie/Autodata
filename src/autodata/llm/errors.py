@@ -45,6 +45,14 @@ _CONTEXT_LENGTH = re.compile(
     re.IGNORECASE,
 )
 _TRANSIENT_STATUS = {408, 409, 429}
+# A gateway (PaperBypass) reports an upstream failure as its own 502 whose body
+# reads "upstream error 400"; the upstream status decides what to do.
+_UPSTREAM_STATUS = re.compile(r"upstream error (\d{3})")
+
+
+def _effective_status(e: openai.APIStatusError) -> int:
+    m = _UPSTREAM_STATUS.search(str(e))
+    return int(m.group(1)) if e.status_code >= 500 and m else e.status_code
 
 
 def classify_api_error(e: openai.APIError) -> LLMError:
@@ -52,7 +60,7 @@ def classify_api_error(e: openai.APIError) -> LLMError:
     if isinstance(e, openai.APIConnectionError):    # includes APITimeoutError
         return TransientLLMError(str(e))
     if isinstance(e, openai.APIStatusError):
-        status = e.status_code
+        status = _effective_status(e)
         if status in _TRANSIENT_STATUS or status >= 500:
             return TransientLLMError(str(e))
         if status == 413 or (status == 400 and _CONTEXT_LENGTH.search(str(e))):
