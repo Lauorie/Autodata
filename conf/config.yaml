@@ -13,7 +13,7 @@ prompts_dir: null
 paths:
   papers_dir: /root/autodl-fs/autodata/papers-mds
   outputs_root: /root/autodl-fs/autodata/outputs
-  qwen_model_dir: /root/autodl-fs/autodata/Qwen3.5-4B
+  qwen_model_dir: /root/autodl-fs/autodata/models/Qwen3.5-4B
 
 inner_loop:
   # The paper gives no budget: accepted items took 6.59 rounds on average,
@@ -80,22 +80,27 @@ meta:
   edit_retries: 2           # re-asks of the implementer after an unusable reply
   workers: 4                # sessions in parallel within one evaluation
 
+# GRPO on the solver (Sec 3.1.2). Rollouts take the solver_generation block:
+# the same thinking, budget and sampling as the weak solver in the loop.
+# scripts/train_grpo.py.
 train:
-  # Defaults sized for 2× A800-80GB. Halve only if OOM.
-  per_device_batch: 8
-  num_generations: 4
-  max_prompt_length: 4096
-  max_completion_length: 384
-  max_length: 4096       # SFT only
-  max_steps: 30          # demo size; bump for a full run
-  learning_rate: 1e-6
-  grad_accum: 1
-  save_steps: 30
-  logging_steps: 2
-  beta: 0.04
-  lora_r: 16
-  lora_alpha: 32
-  lora_dropout: 0.05
+  data: null                # train.jsonl from scripts/build_dataset.py
+  prompts_per_step: 16      # the paper's batch size 16, read as prompts per step
+  num_generations: 8        # completions per prompt; the paper gives no number
+  per_device_batch: 8       # completions per forward pass; sets gradient accumulation
+  max_steps: 200            # Table 2 reports step 200
+  learning_rate: 1e-6       # the paper's value, for full fine-tuning
+  # null trains every weight, as the paper's learning rate suggests. A LoRA
+  # rank (e.g. 16) fits one GPU but learns little at 1e-6: raise the rate.
+  lora_r: null
+  loss_type: grpo           # the paper cites GRPO (Shao et al.); TRL defaults to dapo
+  beta: 0.04                # KL coefficient of Shao et al.; TRL defaults to 0
+  use_vllm: true            # 65k-token rollouts and presence_penalty need vLLM
+  vllm_gpu_memory_utilization: 0.35
+  max_prompt_tokens: 8192   # room for the solver system prompt, context and question
+  judge_workers: 16         # judge calls in parallel per reward batch
+  save_steps: 50
+  logging_steps: 5
 
 hydra:
   run:
