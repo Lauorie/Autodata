@@ -11,5 +11,6 @@ remote_rsync -az --delete --itemize-changes "$@" \
   --exclude '.git/' --exclude '.claude/' --exclude 'Autodata.md' \
   --exclude '.env' --exclude '.secrets/' --exclude 'outputs/' --exclude '.hydra/' \
   --exclude 'multirun/' --exclude '.venv/' --exclude '__pycache__/' \
-  --exclude '.pytest_cache/' --exclude '.ruff_cache/' --exclude '*.egg-info/' \
+  --exclude '.pytest_cache/' --exclude '.ruff_cache/' --exclude '.mypy_cache/' \
+  --exclude '*.egg-info/' \
   "$ROOT/" "$REMOTE:$REMOTE_REPO_DIR/"
