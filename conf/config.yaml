@@ -10,10 +10,14 @@ seed: 42
 # variant directory works too.
 prompts_dir: null
 
+# Every data path hangs off data_root. Set AUTODATA_DATA_ROOT on a new
+# machine, or override one path on the command line. The fallback is the
+# run box's layout.
 paths:
-  papers_dir: /root/autodl-fs/autodata/papers-mds
-  outputs_root: /root/autodl-fs/autodata/outputs
-  qwen_model_dir: /root/autodl-fs/autodata/models/Qwen3.5-4B
+  data_root: ${oc.env:AUTODATA_DATA_ROOT,/root/autodl-fs/autodata}
+  papers_dir: ${paths.data_root}/papers-sciarena
+  outputs_root: ${paths.data_root}/outputs
+  qwen_model_dir: ${paths.data_root}/models/Qwen3.5-4B
 
 inner_loop:
   # The paper gives no budget: accepted items took 6.59 rounds on average,

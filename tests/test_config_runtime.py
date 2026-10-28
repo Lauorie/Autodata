@@ -122,3 +122,20 @@ def test_shipped_meta_config_follows_sec4() -> None:
     assert meta.temperature == 0.1                          # Boltzmann T
     assert (cfg.meta.train_papers, cfg.meta.val_papers) == (50, 25)
     assert meta.val_samples_per_paper * cfg.meta.val_papers == 100   # "100 validation samples"
+
+
+# -- paths -----------------------------------------------------------------------
+# Every data path hangs off one root, so a new machine sets one variable.
+
+def test_paths_follow_the_data_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("AUTODATA_DATA_ROOT", str(tmp_path))
+    paths = _compose().paths
+    assert paths.papers_dir == f"{tmp_path}/papers-sciarena"
+    assert paths.outputs_root == f"{tmp_path}/outputs"
+    assert paths.qwen_model_dir == f"{tmp_path}/models/Qwen3.5-4B"
+
+
+def test_one_path_can_still_be_set_alone(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("AUTODATA_DATA_ROOT", str(tmp_path))
+    paths = _compose("paths.papers_dir=/elsewhere").paths
+    assert (paths.papers_dir, paths.outputs_root) == ("/elsewhere", f"{tmp_path}/outputs")

@@ -11,7 +11,7 @@ Writes, under <outputs_root>/<run_id>/data:
 
 Usage:
     python scripts/build_dataset.py run_id=data1 \\
-        'data.runs=[/root/autodl-fs/autodata/outputs/full_a,/root/autodl-fs/autodata/outputs/full_b]'
+        'data.runs=[<outputs_root>/full_a,<outputs_root>/full_b]'
 """
 
 from __future__ import annotations
