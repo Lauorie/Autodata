@@ -65,3 +65,34 @@ def test_weak_solver_is_served_by_vllm() -> None:
     weak = _from_yaml()["weak_solver"]
     assert weak.endpoint == "vllm"
     assert not weak.model.startswith("/")     # a served model name, not a host path
+
+
+# Flash profile (models=flash), for fast pipeline runs. DeepSeek-V4.1-Flash
+# through the gateway, probed 2026-10-28: thinks even with effort "none";
+# accepts temperature 0.0, 0.7 and 1.0.
+_DEEPSEEK_FLASH_TEMPERATURES = {0.0, 0.7, 1.0}
+
+
+def _flash_from_hydra() -> dict[str, LLMRoleConfig]:
+    with initialize_config_dir(config_dir=str(CONF), version_base=None):
+        cfg = compose(config_name="config", overrides=["run_id=t", "models=flash"])
+    return role_configs_from_dictconfig(cfg.models, cfg.solver_generation)
+
+
+def test_flash_profile_matches_what_the_gateway_accepts() -> None:
+    roles = _flash_from_hydra()
+    for name in _KIMI_ROLES:                      # the same four LLM-only roles
+        role = roles[name]
+        assert role.model == "deepseek/deepseek-v4.1-flash", name
+        assert role.thinking is True, name
+        assert role.temperature in _DEEPSEEK_FLASH_TEMPERATURES, name
+    assert roles["judge"].temperature == 0.0 and roles["judge"].max_tokens >= 16384
+    assert roles["strong_solver"].model == "qwen/qwen3.8-flash"
+    assert roles["weak_solver"].endpoint == "vllm"
+
+
+def test_flash_solvers_still_share_the_generation_block() -> None:
+    roles = _flash_from_hydra()
+    weak, strong = roles["weak_solver"], roles["strong_solver"]
+    for field in ("thinking", "max_tokens", "temperature", "top_p", "top_k", "presence_penalty"):
+        assert getattr(weak, field) == getattr(strong, field), field
