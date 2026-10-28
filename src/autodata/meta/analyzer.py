@@ -36,6 +36,10 @@ A package is accepted when {describe_criteria(c)}. When a package fails, the cha
 gets the paper's earlier failed questions, grouped by failure mode, and writes a new one, \
 up to a round budget.
 
+An accepted package then goes through a fixed end-of-loop filter: the original verifier \
+instructions read it once more, and fixed rubric count rules apply. Rewrites never reach \
+this filter. A session passes only if its accepted package passes the filter too.
+
 Round outcomes: accepted; failed_qv (the verifier rejected it); too_easy (weak scores \
 above the ceiling); weak_zero (a weak answer scored 0); failed_on_strong (strong scores \
 too low, too high, or too close to the weak ones); malformed (the challenger's reply \

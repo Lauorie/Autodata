@@ -6,7 +6,9 @@ arXiv 2606.25996, Sec 4. Each iteration:
   3. The analyzer reads them and writes a root-cause analysis.
   4. The implementer reads the analysis, the log and the parent's prompts,
      and proposes a mutant.
-  5. Re-evaluate parent and mutant on the held-out validation papers.
+  5. Re-evaluate parent and mutant on the held-out validation papers. A
+     session counts only if its question also passes the fixed end-of-loop
+     filter (evaluation.py).
   6. Keep the mutant only if its score strictly beats the parent's mean
      over all its evaluations.
   7. Append the outcome to the log the next iteration reads.
@@ -30,6 +32,7 @@ from ..llm import LLMClient
 from ..llm.errors import LLMError
 from ..llm.prompt_set import PromptSet
 from ..pipeline.acceptance import AcceptanceCriteria
+from ..pipeline.final_filter import RubricShape
 from ..pipeline.inner_loop import InnerLoopConfig
 from .analyzer import analyze
 from .digest import render_sessions
@@ -70,7 +73,8 @@ def _save_sessions(path: Path, result: EvalResult) -> None:
     with path.open("w", encoding="utf-8") as f:
         for s in result.sessions:
             row = {"paper_id": s.paper_id, "passed": s.passed, "stopped_by": s.stopped_by,
-                   "rounds": [asdict(r) for r in s.rounds]}
+                   "rounds": [asdict(r) for r in s.rounds],
+                   "final_filter": s.final_verdict.model_dump() if s.final_verdict else None}
             f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
 
@@ -84,12 +88,13 @@ class _Run:
     clients: dict[str, LLMClient]
     criteria: AcceptanceCriteria
     session_cfg: InnerLoopConfig
+    shape: RubricShape
     cfg: MetaConfig
     out_dir: Path
 
     def evaluate(self, prompts: PromptSet, papers: Sequence[Paper], samples: int) -> EvalResult:
         return evaluate(prompts, papers, self.clients, self.criteria, self.session_cfg,
-                        samples, self.cfg.workers)
+                        self.shape, samples, self.cfg.workers)
 
 
 def _iterate(it: int, run: _Run, population: list[Variant], history: list[IterationRecord],
@@ -143,12 +148,12 @@ def _iterate(it: int, run: _Run, population: list[Variant], history: list[Iterat
 def run_meta_optimization(seed: PromptSet, train_papers: Sequence[Paper],
                           val_papers: Sequence[Paper], clients: dict[str, LLMClient],
                           criteria: AcceptanceCriteria, inner_cfg: InnerLoopConfig,
-                          cfg: MetaConfig, out_dir: str | Path,
+                          shape: RubricShape, cfg: MetaConfig, out_dir: str | Path,
                           rng: random.Random) -> list[Variant]:
     """Run ``cfg.iterations`` iterations; return the final population."""
     out = Path(out_dir)
     run = _Run(seed, train_papers, val_papers, clients, criteria,
-               replace(inner_cfg, max_iterations=cfg.session_rounds), cfg, out)
+               replace(inner_cfg, max_iterations=cfg.session_rounds), shape, cfg, out)
     population = [Variant("seed", None, 0, seed)]
     save_variant(population[0], out, seed)
     history: list[IterationRecord] = []

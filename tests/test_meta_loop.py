@@ -20,12 +20,14 @@ from autodata.meta import outer_loop
 from autodata.meta.evaluation import EvalResult, Session
 from autodata.meta.outer_loop import MetaConfig, run_meta_optimization, split_papers
 from autodata.pipeline.acceptance import AcceptanceCriteria
+from autodata.pipeline.final_filter import RubricShape
 from autodata.pipeline.inner_loop import InnerLoopConfig
 from tests.fakes import ScriptedBackend, make_paper
 
 SEED = PromptSet.seed()
 TRAIN = [make_paper(paper_id=f"t{i}") for i in range(6)]
 VAL = [make_paper(paper_id=f"v{i}") for i in range(3)]
+SHAPE = RubricShape(min_negative=5)
 
 
 class FakeEval:
@@ -36,11 +38,12 @@ class FakeEval:
         self.calls: list[dict[str, Any]] = []
 
     def __call__(self, prompts: PromptSet, papers: list[Any], clients: Any, criteria: Any,
-                 inner_cfg: InnerLoopConfig, samples_per_paper: int = 1,
+                 inner_cfg: InnerLoopConfig, shape: RubricShape, samples_per_paper: int = 1,
                  workers: int = 1) -> EvalResult:
         marker = next((m for m in self.rates if m in prompts.challenger_system), "SEED")
         self.calls.append({"marker": marker, "papers": [p.paper_id for p in papers],
-                           "samples": samples_per_paper, "rounds": inner_cfg.max_iterations})
+                           "samples": samples_per_paper, "rounds": inner_cfg.max_iterations,
+                           "shape": shape})
         n = len(papers) * samples_per_paper
         rate = self.rates.get(marker, 0.0)
         if rate < 0:   # every session lost to infrastructure
@@ -65,7 +68,7 @@ def _run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rates: dict[str, float
                      session_rounds=2, edit_retries=0, workers=1)
     population = run_meta_optimization(
         SEED, TRAIN, VAL, {"meta_optimizer": meta}, AcceptanceCriteria(),
-        InnerLoopConfig(max_iterations=15), cfg, tmp_path, random.Random(0))
+        InnerLoopConfig(max_iterations=15), SHAPE, cfg, tmp_path, random.Random(0))
     return population, fake, backend
 
 
@@ -89,6 +92,12 @@ def test_worse_mutant_is_rejected_but_kept_on_disk(tmp_path: Path,
     assert "WORSE" in (tmp_path / "variants" / "it001" / "diff.patch").read_text()
     assert PromptSet.load(tmp_path / "variants" / "it001" / "prompts").challenger_system.endswith(
         "WORSE")
+
+
+def test_every_evaluation_applies_the_fixed_filter_shape(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, fake, _ = _run(tmp_path, monkeypatch, {"BETTER": 5 / 6}, ["analysis", _mutant("BETTER")])
+    assert [c["shape"] for c in fake.calls] == [SHAPE] * len(fake.calls)
 
 
 def test_a_tie_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -170,8 +179,8 @@ def test_one_real_iteration_end_to_end(tmp_path: Path) -> None:
     cfg = MetaConfig(iterations=1, train_minibatch=1, val_samples_per_paper=1,
                      session_rounds=1, edit_retries=0, workers=1)
     inner = InnerLoopConfig(max_iterations=15, num_solver_samples=2, parallel_solvers=False)
-    run_meta_optimization(SEED, TRAIN[:2], VAL[:2], clients, AcceptanceCriteria(), inner, cfg,
-                          tmp_path, random.Random(0))
+    run_meta_optimization(SEED, TRAIN[:2], VAL[:2], clients, AcceptanceCriteria(), inner,
+                          RubricShape(), cfg, tmp_path, random.Random(0))
 
     analyzer_input = backend.calls[[r for r, _ in backend.calls].index("meta_optimizer")][1]
     assert "WEAK-ANSWER" in analyzer_input[-1]["content"]
@@ -180,3 +189,6 @@ def test_one_real_iteration_end_to_end(tmp_path: Path) -> None:
     assert record["status"] == "rejected"                      # same scores: a tie
     assert (record["parent_score"], record["child_score"]) == (1.0, 1.0)
     assert (tmp_path / "iterations" / "001" / "analysis.md").read_text().startswith("ROOT")
+    row = json.loads((tmp_path / "iterations" / "001" / "val_child.jsonl").read_text()
+                     .splitlines()[0])
+    assert row["final_filter"]["passed"] is True

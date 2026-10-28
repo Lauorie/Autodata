@@ -13,6 +13,7 @@ from autodata.llm.prompt_set import PromptSet
 from autodata.meta.digest import render_sessions
 from autodata.meta.evaluation import EvalResult, Session, evaluate
 from autodata.pipeline.acceptance import AcceptanceCriteria
+from autodata.pipeline.final_filter import RubricShape
 from autodata.pipeline.inner_loop import InnerLoopConfig
 from tests.fakes import (
     STRONG_PER,
@@ -41,10 +42,11 @@ def _backend(**handlers: Any) -> ScriptedBackend:
 
 
 def _run(backend: ScriptedBackend, n_papers: int = 1, samples: int = 1,
-         prompts: PromptSet | None = None) -> EvalResult:
+         prompts: PromptSet | None = None, shape: RubricShape | None = None) -> EvalResult:
     papers = [make_paper(paper_id=f"p{i}") for i in range(n_papers)]
     return evaluate(prompts or PromptSet.seed(), papers, make_clients(backend),
-                    AcceptanceCriteria(), ONE_ROUND, samples_per_paper=samples, workers=1)
+                    AcceptanceCriteria(), ONE_ROUND, shape or RubricShape(),
+                    samples_per_paper=samples, workers=1)
 
 
 def _session(passed: bool, stopped_by: str | None = None) -> Session:
@@ -78,6 +80,45 @@ def test_accepted_question_passes_the_session() -> None:
     result = _run(_backend())
     assert result.score == 1.0
     assert result.sessions[0].stopped_by is None
+
+
+# -- the fixed end-of-loop filter -----------------------------------------------
+# The verifier inside the loop is one of the prompts being optimized. The
+# filter that decides what reaches the dataset is not: an accepted question
+# that it drops is a failed session, or the score rewards questions the
+# dataset never keeps.
+
+def test_accepted_question_must_pass_the_final_filter() -> None:
+    result = _run(_backend(quality_verifier=[qv_payload(), qv_payload("FAIL")]))
+    session = result.sessions[0]
+    assert [r.outcome for r in session.rounds] == ["accepted"]
+    assert session.final_verdict is not None and not session.final_verdict.passed
+    assert (session.passed, session.stopped_by, result.score) == (False, None, 0.0)
+
+
+def test_final_filter_reads_the_seed_verifier_prompt() -> None:
+    seed = PromptSet.seed()
+    backend = _backend()
+    _run(backend, prompts=seed.evolve(qv_system=seed.qv_system + "\nVARIANT-QV"))
+    systems = [m[0]["content"] for r, m in backend.calls if r == "quality_verifier"]
+    assert ["VARIANT-QV" in s for s in systems] == [True, False]
+
+
+def test_final_filter_applies_the_configured_rubric_shape() -> None:
+    backend = _backend()
+    result = _run(backend, shape=RubricShape(min_negative=4))   # the fake rubric has 3
+    assert not result.sessions[0].passed
+    assert sum(r == "quality_verifier" for r, _ in backend.calls) == 1
+
+
+def test_final_filter_outage_leaves_the_session_out() -> None:
+    def down(_m: Any) -> str:
+        raise RuntimeError("gateway down")
+
+    replies = iter([lambda m: qv_payload(), down])
+    result = _run(_backend(quality_verifier=lambda m: next(replies)(m)))
+    assert result.sessions[0].stopped_by == "final_filter_error"
+    assert result.score is None
 
 
 def test_gateway_failure_is_an_infra_stop() -> None:
@@ -115,6 +156,13 @@ def test_digest_shows_answers_scores_and_feedback() -> None:
     assert "0.5 0.5" in text and "1.0 1.0" in text     # per-criterion, per sample
     assert "graded" in text                            # judge feedback
     assert "accepted" in text
+
+
+def test_digest_shows_the_final_filter_verdict() -> None:
+    fail = qv_payload("FAIL", feedback="FILTER-SAYS-WHY")
+    text = render_sessions(_run(_backend(quality_verifier=[qv_payload(), fail])),
+                           answer_chars=300)
+    assert "final filter" in text.lower() and "FILTER-SAYS-WHY" in text
 
 
 def test_digest_clips_long_answers() -> None:

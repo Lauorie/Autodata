@@ -2,12 +2,16 @@
 
 A session is one inner-loop run on one paper under a round budget. It passes
 when a question is accepted within the budget (Sec 4: "the fraction of
-generated QA pairs that successfully separate weak and strong solvers").
+generated QA pairs that successfully separate weak and strong solvers") and
+then passes the end-of-loop filter. The verifier inside the loop is one of
+the prompts under optimization; the filter is not, and it decides what
+reaches the dataset. A score that skipped it would reward questions the
+dataset drops.
 
 A session stopped by an infrastructure failure, or by a paper too long for
 the model, says nothing about the prompts: it leaves the denominator and is
-counted apart. A malformed challenger reply is the prompts' failure and
-stays in.
+counted apart. So does a filter that could not run. A malformed challenger
+reply is the prompts' failure and stays in.
 """
 
 from __future__ import annotations
@@ -18,9 +22,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from ..data_module import Paper
-from ..llm import LLMClient
+from ..llm import LLMClient, VerifierVerdict
 from ..llm.prompt_set import PromptSet
 from ..pipeline.acceptance import AcceptanceCriteria
+from ..pipeline.final_filter import RubricShape, final_filter
 from ..pipeline.inner_loop import (
     InnerLoopConfig,
     RoundRecord,
@@ -38,6 +43,7 @@ class Session:
     rounds: tuple[RoundRecord, ...]
     passed: bool
     stopped_by: str | None    # the infrastructure outcome that ended it early
+    final_verdict: VerifierVerdict | None = None    # the filter's, on an accepted question
 
 
 @dataclass(frozen=True)
@@ -62,7 +68,8 @@ class EvalResult:
 
 
 def _session(paper: Paper, prompts: PromptSet, clients: dict[str, LLMClient],
-             criteria: AcceptanceCriteria, inner_cfg: InnerLoopConfig) -> Session:
+             criteria: AcceptanceCriteria, inner_cfg: InnerLoopConfig,
+             shape: RubricShape) -> Session:
     try:
         qa, rounds = run_inner_loop_for_paper(paper, clients, criteria, inner_cfg, prompts)
     except Exception as e:
@@ -70,18 +77,25 @@ def _session(paper: Paper, prompts: PromptSet, clients: dict[str, LLMClient],
         # and a crash says nothing about the prompts either.
         logger.exception("session on %s crashed: %s", paper.paper_id, e)
         return Session(paper.paper_id, paper.title, (), False, "crash")
-    return Session(paper.paper_id, paper.title, tuple(rounds), qa is not None,
-                   stop_reason(rounds))
+    if qa is None:
+        return Session(paper.paper_id, paper.title, tuple(rounds), False, stop_reason(rounds))
+    try:
+        verdict = final_filter(paper, qa, clients["quality_verifier"], shape,
+                               inner_cfg.infra_retries)
+    except Exception as e:
+        logger.exception("final filter on %s failed: %s", paper.paper_id, e)
+        return Session(paper.paper_id, paper.title, tuple(rounds), False, "final_filter_error")
+    return Session(paper.paper_id, paper.title, tuple(rounds), verdict.passed, None, verdict)
 
 
 def evaluate(prompts: PromptSet, papers: Sequence[Paper], clients: dict[str, LLMClient],
-             criteria: AcceptanceCriteria, inner_cfg: InnerLoopConfig,
+             criteria: AcceptanceCriteria, inner_cfg: InnerLoopConfig, shape: RubricShape,
              samples_per_paper: int = 1, workers: int = 1) -> EvalResult:
     """Run ``samples_per_paper`` sessions on every paper, ``workers`` at a time."""
     jobs = [p for p in papers for _ in range(samples_per_paper)]
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         sessions = tuple(pool.map(
-            lambda p: _session(p, prompts, clients, criteria, inner_cfg), jobs))
+            lambda p: _session(p, prompts, clients, criteria, inner_cfg, shape), jobs))
     result = EvalResult(sessions)
     logger.info("evaluated %d sessions: %d passed, %d scored", len(sessions),
                 result.passed, result.scored)

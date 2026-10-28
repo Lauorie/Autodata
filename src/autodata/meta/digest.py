@@ -2,7 +2,8 @@
 
 The analyzer "reads the full solver exchanges": for every round, the
 package, the verifier's verdict, each solver answer with its judge feedback,
-and the per-criterion scores. Answers are clipped at ``answer_chars``; the
+and the per-criterion scores; then, for an accepted question, the verdict of
+the fixed end-of-loop filter. Answers are clipped at ``answer_chars``; the
 rest is shown whole. Rounds lost to infrastructure are marked, not shown.
 """
 
@@ -87,11 +88,22 @@ def _session_head(n: int, s: Session) -> str:
     return f"=== Session {n} | paper {s.paper_id} \"{s.paper_title}\" | {state} ==="
 
 
+def _final_filter(s: Session) -> list[str]:
+    v = s.final_verdict
+    if v is None:
+        return []
+    lines = [f"Final filter (fixed): {'PASS' if v.passed else 'FAIL'}"]
+    if v.issues:
+        lines.append(f"  issues: {'; '.join(v.issues)}")
+    lines.append(f"  feedback: {v.feedback}")
+    return lines
+
+
 def render_sessions(result: EvalResult, answer_chars: int) -> str:
     blocks = []
     for n, s in enumerate(result.sessions, 1):
         rounds = [render_round(r, answer_chars) for r in s.rounds]
-        blocks.append("\n".join([_session_head(n, s), *rounds]))
+        blocks.append("\n".join([_session_head(n, s), *rounds, *_final_filter(s)]))
     return "\n\n".join(blocks)
 
 

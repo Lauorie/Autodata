@@ -32,6 +32,7 @@ from autodata.config_runtime import (
 from autodata.data_module import iter_papers
 from autodata.llm import PromptSet, UsageMeter
 from autodata.meta import run_meta_optimization, split_papers
+from autodata.pipeline.final_filter import RubricShape
 from autodata.utils import get_logger, set_seed, setup_logging, write_json
 
 logger = get_logger(__name__)
@@ -59,8 +60,8 @@ def main(cfg: DictConfig) -> None:
     seed = PromptSet.load(cfg.prompts_dir) if cfg.prompts_dir else PromptSet.seed()
     population = run_meta_optimization(
         seed, train, val, clients, acceptance_from_dictconfig(cfg.acceptance),
-        inner_loop_from_dictconfig(cfg.inner_loop), meta_from_dictconfig(cfg.meta),
-        out_dir, random.Random(cfg.seed))
+        inner_loop_from_dictconfig(cfg.inner_loop), RubricShape(**cfg.final_filter),
+        meta_from_dictconfig(cfg.meta), out_dir, random.Random(cfg.seed))
 
     best = max(population, key=lambda v: v.mean if v.mean is not None else -1.0)
     write_json(out_dir / "summary.json", {
