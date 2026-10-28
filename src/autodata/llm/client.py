@@ -172,7 +172,7 @@ class _OpenAIBackend:
         if not api_key or not base_url:
             raise RuntimeError(
                 f"{role_cfg.base_url_env} and {role_cfg.api_key_env} env vars must be set "
-                "(see .secrets/remote.env.example)"
+                "(copy .env.example to .secrets/remote.env)"
             )
         channel = os.environ.get("PROXY_HEADER_X_CHANNEL") if role_cfg.endpoint == "proxy" else None
         # max_retries=0: `chat` retries transient errors itself; SDK retries on
