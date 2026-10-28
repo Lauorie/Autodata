@@ -44,7 +44,7 @@ def select_parent(population: Sequence[Variant], temperature: float,
 
 
 def diff_against(seed: PromptSet, prompts: PromptSet) -> str:
-    parts = []
+    parts: list[str] = []
     for f in MUTABLE_FIELDS:
         a, b = getattr(seed, f), getattr(prompts, f)
         if a != b:

@@ -1,6 +1,6 @@
 """Boltzmann sampling for parent selection.
 
-Per AutoData blog: P(parent_c) ∝ exp(s_c / T), with T=0.1.
+arXiv 2606.25996, Sec 4: P(parent_c) ∝ exp(s_c / T), with T=0.1.
 """
 
 from __future__ import annotations
@@ -21,17 +21,17 @@ def boltzmann_sample(
     """
     if not scores:
         raise ValueError("empty score list")
+    choice = rng.choice if rng is not None else random.choice
+    draw = rng.random if rng is not None else random.random
     if temperature <= 0:
         # degenerate: take the argmax (with ties broken by RNG)
-        rng = rng or random
         best = max(scores)
         idxs = [i for i, s in enumerate(scores) if s == best]
-        return rng.choice(idxs)
-    rng = rng or random
+        return choice(idxs)
     max_s = max(scores)
     weights = [math.exp((s - max_s) / temperature) for s in scores]
     total = sum(weights)
-    r = rng.random() * total
+    r = draw() * total
     acc = 0.0
     for i, w in enumerate(weights):
         acc += w

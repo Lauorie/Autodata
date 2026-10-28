@@ -26,6 +26,7 @@ import random
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import Any
 
 from ..data_module import Paper
 from ..llm import LLMClient
@@ -124,25 +125,28 @@ def _iterate(it: int, run: _Run, population: list[Variant], history: list[Iterat
     child_val = run.evaluate(child.prompts, run.val, cfg.val_samples_per_paper)
     _save_sessions(d / "val_parent.jsonl", parent_val)
     _save_sessions(d / "val_child.jsonl", child_val)
-    common = {"child_id": child.variant_id, "changed": proposal.changed,
-              "rationale": proposal.rationale}
-    if not (parent_val.is_valid(cfg.min_scored_fraction)
-            and child_val.is_valid(cfg.min_scored_fraction)):
+    common: dict[str, Any] = {"child_id": child.variant_id, "changed": proposal.changed,
+                              "rationale": proposal.rationale}
+    parent_score, child_score = parent_val.score, child_val.score
+    if (parent_score is None or child_score is None
+            or not parent_val.is_valid(cfg.min_scored_fraction)
+            or not child_val.is_valid(cfg.min_scored_fraction)):
         save_variant(child, run.out_dir, run.seed)
         note = (f"scored {parent_val.scored}/{len(parent_val.sessions)} parent and "
                 f"{child_val.scored}/{len(child_val.sessions)} child sessions")
         return IterationRecord(it, parent.variant_id, "invalid_eval", note=note, **common)
 
-    parent = parent.with_score(parent_val.score)
+    parent = parent.with_score(parent_score)
     population[idx] = parent
-    child = child.with_score(child_val.score)
-    accepted = child_val.score > parent.mean
+    child = child.with_score(child_score)
+    parent_mean = sum(parent.scores) / len(parent.scores)
+    accepted = child_score > parent_mean
     if accepted:
         population.append(child)
     save_variant(parent, run.out_dir, run.seed)
     save_variant(child, run.out_dir, run.seed)
     return IterationRecord(it, parent.variant_id, "accepted" if accepted else "rejected",
-                           parent_score=parent.mean, child_score=child_val.score, **common)
+                           parent_score=parent_mean, child_score=child_score, **common)
 
 
 def run_meta_optimization(seed: PromptSet, train_papers: Sequence[Paper],
