@@ -37,12 +37,28 @@ def test_solvers_share_the_generation_block(load) -> None:
     assert weak.max_tokens == 65536           # paper App A reasoning budget
 
 
+# Kimi-K3 behind the PaperBypass gateway, probed 2026-10-28: it thinks whatever
+# the request says, and it rejects any temperature but 0.0, 0.6 and 1.0 (0.7
+# came back as a 502 "upstream error 400").
+_KIMI_K3_TEMPERATURES = {0.0, 0.6, 1.0}
+_KIMI_ROLES = ("challenger", "quality_verifier", "judge", "meta_optimizer")
+
+
 @pytest.mark.parametrize("load", [_from_hydra, _from_yaml])
-def test_verifier_and_judge_do_not_think(load) -> None:
+def test_kimi_roles_match_what_the_gateway_accepts(load) -> None:
     roles = load()
-    assert roles["challenger"].thinking is True
-    assert roles["quality_verifier"].thinking is False
-    assert roles["judge"].thinking is False
+    for name in _KIMI_ROLES:
+        role = roles[name]
+        assert role.model == "moonshotai/kimi-k3", name
+        assert role.thinking is True, name           # budget max_tokens for the thought
+        assert role.temperature in _KIMI_K3_TEMPERATURES, name
+    assert roles["quality_verifier"].temperature == 0.0
+    assert roles["judge"].temperature == 0.0
+    assert roles["judge"].max_tokens >= 16384        # thought + one score per rubric item
+
+
+def test_strong_solver_is_qwen38_max() -> None:
+    assert _from_yaml()["strong_solver"].model == "qwen/qwen3.8-max"
 
 
 def test_weak_solver_is_served_by_vllm() -> None:

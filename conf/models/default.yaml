@@ -1,39 +1,44 @@
 # Model assignments. Every endpoint speaks the OpenAI Chat Completions API.
-# `endpoint: proxy` -> wismodel proxy (OpenRouter). `endpoint: vllm` -> an
-# OpenAI-compatible vLLM server (scripts/serve_weak_solver.sh). `endpoint:
-# local_hf` -> in-process transformers, one sample at a time: smoke tests only.
+# `endpoint: proxy` -> the LLM gateway at PROXY_BASE_URL (PaperBypass or the
+# wismodel proxy). `endpoint: vllm` -> an OpenAI-compatible vLLM server
+# (scripts/serve_weak_solver.sh). `endpoint: local_hf` -> in-process
+# transformers, one sample at a time: smoke tests only.
 #
 # `thinking` switches the model's reasoning on or off. `max_tokens` caps
 # thinking + answer together.
 #
 # Solvers: thinking, budget, and sampling come from `solver_generation` in
 # conf/config.yaml, applied in code to both. Do not set them here.
+#
+# Kimi-K3 through the gateway (probed 2026-10-28): it always thinks, even when
+# asked not to, so every Kimi role is marked thinking and given room for the
+# thought. It accepts temperature 0.0, 0.6 or 1.0 and rejects 0.7.
 
 challenger:
   endpoint: proxy
-  model: moonshotai/kimi-k2.6
-  temperature: 0.7
-  max_tokens: 32768         # 4000 truncated 29 times with thinking on
+  model: moonshotai/kimi-k3
+  temperature: 1.0
+  max_tokens: 32768         # 4000 truncated 29 times with thinking on (Kimi-K2.6)
   thinking: true
   reasoning_effort: auto
 
 quality_verifier:
   endpoint: proxy
-  model: moonshotai/kimi-k2.6
+  model: moonshotai/kimi-k3
   temperature: 0.0
-  max_tokens: 4096          # verdict JSON with per-check issues
-  thinking: false           # Fig 9 is a fast verdict; the paper is silent
+  max_tokens: 16384         # thought + verdict JSON with per-check issues
+  thinking: true            # cannot be switched off on Kimi-K3
 
 judge:
   endpoint: proxy
-  model: moonshotai/kimi-k2.6
+  model: moonshotai/kimi-k3
   temperature: 0.0
-  max_tokens: 4096          # one score per rubric item plus feedback
-  thinking: false
+  max_tokens: 16384         # thought + one score per rubric item and feedback
+  thinking: true
 
 strong_solver:
   endpoint: proxy
-  model: qwen/qwen3.5-397b-a17b
+  model: qwen/qwen3.8-max
   reasoning_effort: auto    # thinking on, model default effort
 
 weak_solver:
@@ -44,8 +49,8 @@ weak_solver:
 
 meta_optimizer:
   endpoint: proxy
-  model: moonshotai/kimi-k2.6
-  temperature: 0.4
-  max_tokens: 12000
+  model: moonshotai/kimi-k3
+  temperature: 1.0
+  max_tokens: 16384
   thinking: true
   reasoning_effort: auto    # heavy reasoning for code edits
