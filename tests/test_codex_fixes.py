@@ -10,11 +10,8 @@ import pytest
 from autodata.llm.schemas import QAPair, RubricCriterion, RubricSpec
 from autodata.pipeline.acceptance import AcceptanceCriteria
 from autodata.pipeline.evaluate_rubric import _normalise_judge_scores
-from autodata.pipeline.inner_loop import (
-    InnerLoopConfig,
-    _qv_step,
-    run_inner_loop_for_paper,
-)
+from autodata.pipeline.inner_loop import InnerLoopConfig, run_inner_loop_for_paper
+from autodata.pipeline.quality_verifier import verify_quality
 from tests.fakes import ScriptedBackend, challenger_payload, make_clients, make_paper, qv_payload
 
 # ---------------------------------------------------------------------------
@@ -50,14 +47,14 @@ def _qa_for_qv() -> QAPair:
 ])
 def test_qv_verdict_fails_closed(payload: str, expected: bool) -> None:
     backend = ScriptedBackend(handlers={"quality_verifier": [payload]})
-    verdict = _qv_step(make_clients(backend)["quality_verifier"], make_paper(), _qa_for_qv())
+    verdict = verify_quality(make_clients(backend)["quality_verifier"], make_paper(), _qa_for_qv())
     assert verdict.passed is expected
 
 
 def test_qv_failure_lists_failed_checks() -> None:
     payload = qv_payload("FAIL", check_1_verdict="LEAKS_ANSWER", check_3_verdict="FAIL")
     backend = ScriptedBackend(handlers={"quality_verifier": [payload]})
-    verdict = _qv_step(make_clients(backend)["quality_verifier"], make_paper(), _qa_for_qv())
+    verdict = verify_quality(make_clients(backend)["quality_verifier"], make_paper(), _qa_for_qv())
     assert "check_1_verdict=LEAKS_ANSWER" in verdict.issues
     assert "check_3_verdict=FAIL" in verdict.issues
     assert not any(i.startswith("check_2") for i in verdict.issues)

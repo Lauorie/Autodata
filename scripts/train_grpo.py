@@ -5,7 +5,7 @@ LoRA r=16 on the text-only causal head, BF16, single A800-80GB suffices.
 
 Usage:
     python scripts/train_grpo.py \\
-        accepted_qa=/root/autodl-fs/autodata/outputs/full/accepted_qa.jsonl \\
+        accepted_qa=/root/autodl-fs/autodata/outputs/full/final_qa.jsonl \\
         run_id=grpo1 \\
         train.max_steps=200 train.per_device_batch=2 train.num_generations=4
 """

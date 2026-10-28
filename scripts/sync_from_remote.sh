@@ -15,10 +15,11 @@ sshpass -p "$REMOTE_PASSWORD" rsync -az --delete -e "ssh -p $REMOTE_PORT -o Stri
   --exclude '.secrets/' --exclude '__pycache__/' --exclude 'outputs/' --exclude '.hydra/' --exclude '.venv/' \
   "$REMOTE_USER@$REMOTE_HOST:/root/autodata/" "$ROOT/"
 
-echo "Pulling outputs (summaries + accepted_qa.jsonl + meta population only)..."
+echo "Pulling outputs (summaries + accepted/final QA + filter verdicts + meta population only)..."
 mkdir -p "$ROOT/outputs"
 sshpass -p "$REMOTE_PASSWORD" rsync -az -e "ssh -p $REMOTE_PORT" \
   --include '*/' --include 'summary.json' --include 'accepted_qa.jsonl' \
+  --include 'final_qa.jsonl' --include 'final_filter.jsonl' \
   --include 'population.json' --include '*.log' --exclude '*' \
   "$REMOTE_USER@$REMOTE_HOST:/root/autodl-fs/autodata/outputs/" "$ROOT/outputs/"
 

@@ -1,8 +1,10 @@
 """Extract training QAs for GRPO from a run.
 
-Default behaviour: emit every ACCEPTED QA pair from ``accepted_qa.jsonl``.
+Default behaviour: emit every QA pair in ``final_qa.jsonl``: accepted by the
+loop and kept by the end-of-loop filter (the paper trains on that filtered
+set, Sec 3.1).
 
-Fallback (``--include-best-rejected N``): if ``accepted_qa.jsonl`` has fewer
+Fallback (``--include-best-rejected N``): if ``final_qa.jsonl`` has fewer
 than ``--min-accepted`` rows, we top up the training set with the highest-gap
 *rejected* rounds from ``rounds.jsonl``. This is a pragmatic compromise — a
 QA pair with gap=0.18 (just under threshold) still carries meaningful
@@ -28,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 def load_accepted(run_dir: Path) -> list[dict]:
-    p = run_dir / "accepted_qa.jsonl"
+    p = run_dir / "final_qa.jsonl"
     if not p.exists():
         return []
     rows = []
@@ -43,7 +45,8 @@ def load_accepted(run_dir: Path) -> list[dict]:
 def best_rejected(run_dir: Path, n: int) -> list[dict]:
     """Pull the top-``n`` rejected rounds (by gap) from rounds.jsonl.
 
-    Returns QA dicts shaped like accepted_qa.jsonl entries.
+    Returns QA dicts shaped like final_qa.jsonl entries. Rounds that never
+    reached the strong solver have no gap and are skipped.
     """
     p = run_dir / "rounds.jsonl"
     if not p.exists():
@@ -62,9 +65,10 @@ def best_rejected(run_dir: Path, n: int) -> list[dict]:
         qa = row.get("qa")
         if not qa:                         # error/QV-rejected rounds have no qa
             continue
-        acc = row.get("acceptance") or {}
-        gap = float(acc.get("gap", 0.0))
-        candidates.append((gap, qa))
+        gap = (row.get("acceptance") or {}).get("gap")
+        if gap is None:                    # weak-first: strong never ran
+            continue
+        candidates.append((float(gap), qa))
     candidates.sort(key=lambda t: -t[0])
     return [qa for _, qa in candidates[:n]]
 
@@ -74,14 +78,14 @@ def main() -> int:
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--min-accepted", type=int, default=10,
-                    help="If accepted_qa.jsonl has fewer than this many rows, top up with best-rejected.")
+                    help="If final_qa.jsonl has fewer than this many rows, top up with best-rejected.")
     ap.add_argument("--include-best-rejected", type=int, default=0,
                     help="Max number of rejected rounds to add (0 = never, even if accepted is empty).")
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir)
     accepted = load_accepted(run_dir)
-    logger.info("accepted: %d", len(accepted))
+    logger.info("final (accepted + filtered): %d", len(accepted))
 
     chosen = list(accepted)
     if len(accepted) < args.min_accepted and args.include_best_rejected > 0:

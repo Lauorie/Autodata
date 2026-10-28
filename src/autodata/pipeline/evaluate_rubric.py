@@ -77,6 +77,10 @@ def _normalise_judge_scores(raw_scores: list[float], expected_n: int) -> list[fl
     return clamped
 
 
+class _JudgeOutputError(ValueError):
+    """The judge replied, but not with a readable per-criterion score list."""
+
+
 def _ask_judge(judge: LLMClient, qa: QAPair, candidate: str) -> tuple[list[float], str]:
     # The judge never sees the reference answer (paper Sec 3.1).
     raw = judge.chat([
@@ -95,21 +99,29 @@ def _ask_judge(judge: LLMClient, qa: QAPair, candidate: str) -> tuple[list[float
         return per, fb
     except Exception as e:
         logger.warning("judge parse failed: %s -- raw=%r", e, raw[:200])
-        # treat parse failure as a zero score (don't credit broken evals)
-        return [0.0] * n_crit, f"PARSE_FAIL: {e}"
+        raise _JudgeOutputError(str(e)) from e
+
+
+def _infra_failure(answer: str, n_crit: int, reason: str) -> SolverScore:
+    return SolverScore(answer=answer, per_criterion=[0.0] * n_crit, weighted_score=0.0,
+                       judge_feedback=reason, infra_error=True)
 
 
 def _score_one(solver: LLMClient, judge: LLMClient,
                qa: QAPair, weights: list[int], idx: int) -> SolverScore:
+    # Fig 7: SOLVER_ERROR or an empty response is an infrastructure failure,
+    # flagged so the loop never reads it as a low score.
     try:
         ans = _ask_solver(solver, qa)
     except Exception as e:
         logger.warning("solver call failed sample %d: %s", idx, e)
-        return SolverScore(answer=f"ERROR: {e}",
-                           per_criterion=[0.0] * len(weights),
-                           weighted_score=0.0,
-                           judge_feedback="solver_error")
-    per, fb = _ask_judge(judge, qa, ans)
+        return _infra_failure(f"ERROR: {e}", len(weights), "solver_error")
+    if not ans.strip():
+        return _infra_failure(ans, len(weights), "solver_error: empty response")
+    try:
+        per, fb = _ask_judge(judge, qa, ans)
+    except _JudgeOutputError as e:
+        return _infra_failure(ans, len(weights), f"PARSE_FAIL: {e}")
     return SolverScore(
         answer=ans,
         per_criterion=per,

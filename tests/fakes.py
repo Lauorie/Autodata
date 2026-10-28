@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from autodata.data_module import Paper
-from autodata.llm import LLMClient, LLMRoleConfig
+from autodata.llm import LLMClient, LLMRoleConfig, QAPair, RubricSpec
 
 ROLES = ("challenger", "quality_verifier", "weak_solver", "strong_solver", "judge")
 
@@ -27,7 +27,7 @@ RUBRIC = [
 ]
 
 
-def challenger_payload(**overrides: object) -> str:
+def _qa_fields(**overrides: object) -> dict[str, object]:
     body: dict[str, object] = {
         "question_type": "failure mode prediction",
         "skill_tags": ["causal_reasoning", "counterfactual"],
@@ -37,7 +37,16 @@ def challenger_payload(**overrides: object) -> str:
         "rubric": RUBRIC,
     }
     body.update(overrides)
-    return json.dumps(body)
+    return body
+
+
+def challenger_payload(**overrides: object) -> str:
+    return json.dumps(_qa_fields(**overrides))
+
+
+def make_qa(**overrides: object) -> QAPair:
+    fields = _qa_fields(**overrides)
+    return QAPair(**{**fields, "rubric": RubricSpec(criteria=fields["rubric"])}, paper_id="papX")
 
 
 def qv_payload(overall: str = "PASS", **overrides: object) -> str:
@@ -63,6 +72,8 @@ def judge_payload(per: list[float]) -> str:
 WEAK_PER = [0.5] * 7 + [0.0] * 3          # 9 / 18  = 0.500
 STRONG_PER = [1.0] * 6 + [0.0] * 4        # 16 / 18 = 0.889
 STRONG_LOW_PER = [0.5] * 7 + [0.0] * 3    # 9 / 18  = 0.500
+WEAK_HIGH_PER = [1.0] * 7 + [0.0] * 3     # 18 / 18 = 1.000 (too easy)
+WEAK_ZERO_PER = [0.0] * 10                # 0 / 18  = 0.000
 
 
 Handler = Callable[[list[dict[str, str]]], str]
@@ -105,6 +116,22 @@ def judge_by_solver(weak_per: list[float], strong_per: list[float]) -> Handler:
     def handle(messages: list[dict[str, str]]) -> str:
         user = messages[-1]["content"]
         return judge_payload(strong_per if "STRONG-ANSWER" in user else weak_per)
+
+    return handle
+
+
+def judge_by_question(table: dict[str, tuple[list[float], list[float]]]) -> Handler:
+    """Judge handler keyed on the question, then on which solver answered.
+
+    ``table`` maps question text to ``(weak_per, strong_per)``.
+    """
+
+    def handle(messages: list[dict[str, str]]) -> str:
+        user = messages[-1]["content"]
+        for question, (weak_per, strong_per) in table.items():
+            if f"QUESTION: {question}\n" in user:
+                return judge_payload(strong_per if "STRONG-ANSWER" in user else weak_per)
+        raise AssertionError(f"judge got an unscripted question: {user[:200]!r}")
 
     return handle
 

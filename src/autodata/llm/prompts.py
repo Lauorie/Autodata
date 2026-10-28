@@ -73,13 +73,18 @@ def challenger_user(paper_title: str, paper_id: str, paper_text: str, feedback: 
         '"""',
         paper_text,
         '"""',
+        "",
     ]
-    if feedback:
+    if not feedback:
+        blocks.append("Generate a challenging research question-answer pair with grading "
+                      "rubrics. Read the whole paper above first.")
+    else:
+        # Refinement round (Fig 7): earlier failures arrive grouped by mode.
         blocks += [
-            "",
-            "PRIOR FEEDBACK (your previous attempt was rejected):",
             feedback,
-            "Adjust your QA + rubric to address ALL of the above issues.",
+            "",
+            "Generate an ENTIRELY NEW question from a DIFFERENT angle that requires "
+            "deeper reasoning.",
         ]
     return "\n".join(blocks)
 

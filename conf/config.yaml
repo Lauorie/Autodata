@@ -12,8 +12,17 @@ paths:
   qwen_model_dir: /root/autodl-fs/autodata/Qwen3.5-4B
 
 inner_loop:
-  max_iterations: 6
+  # The paper gives no budget: accepted items took 6.59 rounds on average,
+  # with a tail past 10 (Sec 3.1.1). 15 covers that tail.
+  max_iterations: 15
   num_solver_samples: 3
+
+# End-of-loop filter: Fig 9 check-3 rubric counts, then one more QV call.
+final_filter:
+  min_positive: 4
+  min_negative: 3
+  min_total: 10
+  max_total: 20
 
 run:
   papers_limit: null

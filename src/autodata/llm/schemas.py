@@ -89,6 +89,7 @@ class SolverScore(BaseModel):
     per_criterion: list[float]   # 0..1 per criterion
     weighted_score: float        # 0..1, signed-weight rubric score
     judge_feedback: str = ""
+    infra_error: bool = False    # solver failed or judge output unreadable: not a score
 
     @field_validator("per_criterion")
     @classmethod
