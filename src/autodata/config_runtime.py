@@ -82,7 +82,6 @@ def role_configs_from_dictconfig(models: Any, solver_generation: Any) -> dict[st
 
 def acceptance_from_dictconfig(c: Any) -> AcceptanceCriteria:
     return AcceptanceCriteria(
-        quality_verifier_must_pass=bool(c.quality_verifier_must_pass),
         weak_avg_max=float(c.weak_avg_max),
         weak_max_max=float(c.weak_max_max),
         no_zeros=bool(c.no_zeros),

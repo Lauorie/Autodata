@@ -4,7 +4,8 @@ Fig 7 criteria (arXiv 2606.25996), checked in two stages so the strong
 solver runs only on questions the weak solver fails (Sec 3.1):
 - weak stage: weak_avg ≤ 0.65, max(weak_samples) ≤ 0.75, no weak score is 0
 - strong stage: 0.60 ≤ strong_avg < 0.95, gap = strong_avg - weak_avg ≥ 0.20
-- Quality Verifier must pass
+
+The quality verifier's gate comes before both, in the inner loop.
 """
 
 from __future__ import annotations
@@ -15,28 +16,12 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class AcceptanceCriteria:
-    quality_verifier_must_pass: bool = True
     weak_avg_max: float = 0.65
     weak_max_max: float = 0.75
     no_zeros: bool = True
     strong_avg_min: float = 0.60
     strong_avg_max: float = 0.95
     gap_min: float = 0.20
-
-
-@dataclass(frozen=True)
-class AcceptanceResult:
-    accepted: bool
-    reasons: list[str]
-    weak_avg: float
-    weak_max: float
-    strong_avg: float
-    gap: float
-
-    def to_feedback(self) -> str:
-        if self.accepted:
-            return "ACCEPTED"
-        return "; ".join(self.reasons)
 
 
 @dataclass(frozen=True)
@@ -99,38 +84,10 @@ def check_strong(weak_avg: float, strong_scores: Sequence[float],
     return StrongCheck(strong_avg, gap, reasons=reasons)
 
 
-def check_acceptance(
-    weak_scores: list[float],
-    strong_scores: list[float],
-    quality_verifier_passed: bool,
-    criteria: AcceptanceCriteria,
-) -> AcceptanceResult:
-    if not weak_scores or not strong_scores:
-        return AcceptanceResult(
-            accepted=False,
-            reasons=["empty solver score lists"],
-            weak_avg=0.0, weak_max=0.0, strong_avg=0.0, gap=0.0,
-        )
-    weak = check_weak(weak_scores, criteria)
-    strong = check_strong(weak.weak_avg, strong_scores, criteria)
-    reasons: list[str] = []
-    if criteria.quality_verifier_must_pass and not quality_verifier_passed:
-        reasons.append("quality_verifier_failed")
-    reasons += weak.reasons + strong.reasons
-    return AcceptanceResult(
-        accepted=not reasons,
-        reasons=reasons,
-        weak_avg=weak.weak_avg, weak_max=weak.weak_max,
-        strong_avg=strong.strong_avg, gap=strong.gap,
-    )
-
-
 __all__ = [
     "AcceptanceCriteria",
-    "AcceptanceResult",
     "StrongCheck",
     "WeakCheck",
-    "check_acceptance",
     "check_strong",
     "check_weak",
 ]

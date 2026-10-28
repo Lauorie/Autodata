@@ -1,6 +1,6 @@
 """Inner / evaluation pipeline."""
 
-from .acceptance import AcceptanceCriteria, AcceptanceResult, check_acceptance
+from .acceptance import AcceptanceCriteria, check_strong, check_weak
 from .evaluate_rubric import rubric_score, score_solver
 from .final_filter import RubricShape, final_filter
 from .inner_loop import InnerLoopConfig, RoundRecord, run_inner_loop_for_paper
@@ -8,11 +8,11 @@ from .quality_verifier import verify_quality
 
 __all__ = [
     "AcceptanceCriteria",
-    "AcceptanceResult",
     "InnerLoopConfig",
     "RoundRecord",
     "RubricShape",
-    "check_acceptance",
+    "check_strong",
+    "check_weak",
     "final_filter",
     "rubric_score",
     "run_inner_loop_for_paper",
