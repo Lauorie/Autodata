@@ -118,6 +118,12 @@ def test_reply_without_a_change_is_refused() -> None:
         _propose(client, retries=0)
 
 
+def test_trailing_blank_lines_are_not_a_change() -> None:
+    client, _ = _meta(_reply(rationale="r", challenger_system=SEED.challenger_system + "\n\n"))
+    with pytest.raises(ImplementerError, match="no field changed"):
+        _propose(client, retries=0)
+
+
 def test_oversized_prompts_are_refused() -> None:
     client, _ = _meta(_reply(rationale="r", challenger_system=SEED.challenger_system + "x" * 900))
     with pytest.raises(ImplementerError, match="characters"):

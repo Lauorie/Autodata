@@ -84,7 +84,9 @@ def _current(prompts: PromptSet) -> str:
 
 def _parse(raw: str, parent: PromptSet,
            max_prompt_chars: int) -> tuple[Proposal | None, list[str]]:
-    blocks = {name: text for name, text in _BLOCK.findall(raw)}
+    # Strip trailing newlines as PromptSet.load does, so an unchanged field
+    # with a blank line after it is no change.
+    blocks = {name: text.rstrip("\n") for name, text in _BLOCK.findall(raw)}
     rationale = blocks.pop("rationale", "").strip()
     problems = [f"{name} is not a field you may change" for name in blocks
                 if name not in MUTABLE_FIELDS]
