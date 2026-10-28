@@ -9,6 +9,7 @@ from .errors import (
     TransientLLMError,
 )
 from .schemas import QAPair, RubricCriterion, RubricSpec, SolverScore, VerifierVerdict
+from .usage import UsageMeter
 
 __all__ = [
     "ContextLengthError",
@@ -22,6 +23,7 @@ __all__ = [
     "RubricSpec",
     "SolverScore",
     "TransientLLMError",
+    "UsageMeter",
     "VerifierVerdict",
     "build_client_pool",
 ]

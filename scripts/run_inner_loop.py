@@ -28,7 +28,7 @@ from autodata.config_runtime import (
     role_configs_from_dictconfig,
 )
 from autodata.data_module import Paper, iter_papers
-from autodata.llm import LLMClient, QAPair, VerifierVerdict
+from autodata.llm import LLMClient, QAPair, UsageMeter, VerifierVerdict
 from autodata.pipeline.acceptance import AcceptanceCriteria
 from autodata.pipeline.final_filter import RubricShape, final_filter
 from autodata.pipeline.inner_loop import InnerLoopConfig, RoundRecord, run_inner_loop_for_paper
@@ -82,7 +82,8 @@ def main(cfg: DictConfig) -> None:
     logger.info("run_id=%s out_dir=%s", cfg.run_id, out_dir)
 
     role_configs = role_configs_from_dictconfig(cfg.models, cfg.solver_generation)
-    clients = build_client_pool(role_configs)
+    meter = UsageMeter(out_dir / "usage.jsonl")     # one line per completed call
+    clients = build_client_pool(role_configs, meter=meter)
     criteria = _criteria_from(cfg.acceptance)
     inner_cfg = InnerLoopConfig(
         max_iterations=int(cfg.inner_loop.max_iterations),
@@ -181,6 +182,7 @@ def main(cfg: DictConfig) -> None:
         "elapsed_s": elapsed,
         "yield_per_paper": n_accepted / max(n_done, 1),
         "rounds_per_paper": n_rounds / max(n_done, 1),
+        "usage": meter.totals(),
     })
     logger.info("DONE: papers=%d rounds=%d accepted=%d final=%d outcomes=%s elapsed=%.1fs",
                 n_done, n_rounds, n_accepted, n_final, dict(outcomes), elapsed)

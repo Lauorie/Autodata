@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -31,6 +32,7 @@ from tenacity import (
 
 from .errors import OutputTruncatedError, TransientLLMError, classify_api_error
 from .thinking import split_thinking
+from .usage import UsageMeter
 
 logger = logging.getLogger(__name__)
 
@@ -149,16 +151,18 @@ class _OpenAIBackend:
     ``reasoning.effort``; 'vllm' uses the chat template's ``enable_thinking``.
     """
 
-    def __init__(self, client: Any, flavor: str, label: str) -> None:
+    def __init__(self, client: Any, flavor: str, label: str,
+                 meter: UsageMeter | None = None) -> None:
         if flavor not in ("openrouter", "vllm"):
             raise ValueError(f"unknown flavor {flavor!r}")
         self._client = client
         self._flavor = flavor
         self._label = label
         self._warned_no_reasoning: set[str] = set()
+        self._meter = meter
 
     @classmethod
-    def from_env(cls, role_cfg: LLMRoleConfig) -> _OpenAIBackend:
+    def from_env(cls, role_cfg: LLMRoleConfig, meter: UsageMeter | None = None) -> _OpenAIBackend:
         from openai import OpenAI
 
         base_url = os.environ.get(role_cfg.base_url_env)
@@ -176,7 +180,7 @@ class _OpenAIBackend:
         client = OpenAI(api_key=api_key, base_url=base_url, timeout=1800.0, max_retries=0,
                         default_headers={"X-Channel": channel} if channel else None)
         flavor = "openrouter" if role_cfg.endpoint == "proxy" else "vllm"
-        return cls(client, flavor=flavor, label=role_cfg.base_url_env)
+        return cls(client, flavor=flavor, label=role_cfg.base_url_env, meter=meter)
 
     def _request(self, role_cfg: LLMRoleConfig, messages: list[dict[str, str]]) -> dict[str, Any]:
         extra_body: dict[str, Any] = {}
@@ -220,6 +224,7 @@ class _OpenAIBackend:
         reraise=True,
     )
     def chat(self, role_cfg: LLMRoleConfig, messages: list[dict[str, str]]) -> str:
+        start = time.monotonic()
         try:
             resp = self._client.chat.completions.create(**self._request(role_cfg, messages))
         except openai.APIError as e:
@@ -228,6 +233,9 @@ class _OpenAIBackend:
                            self._label, e)
             raise err from e
         choice = resp.choices[0]
+        if self._meter is not None:
+            self._meter.record(role_cfg.role, role_cfg.model, getattr(resp, "usage", None),
+                               time.monotonic() - start, choice.finish_reason)
         raw = choice.message.content or ""
         answer, finished = split_thinking(raw, prompt_opened=False)
         self._check_reasoning(role_cfg, choice.message, raw)
@@ -368,15 +376,19 @@ class _Pool:
     local_hf: dict[str, _LocalHFBackend] = field(default_factory=dict)
 
 
-def build_client_pool(role_configs: dict[str, LLMRoleConfig]) -> dict[str, LLMClient]:
-    """Build one ``LLMClient`` per role, sharing backends underneath."""
+def build_client_pool(role_configs: dict[str, LLMRoleConfig],
+                      meter: UsageMeter | None = None) -> dict[str, LLMClient]:
+    """Build one ``LLMClient`` per role, sharing backends underneath.
+
+    ``meter`` counts the tokens of every remote call (local HF is not metered).
+    """
     pool = _Pool()
     out: dict[str, LLMClient] = {}
     for role, cfg in role_configs.items():
         if cfg.endpoint in ("proxy", "vllm"):
             key = (cfg.endpoint, cfg.base_url_env)
             if key not in pool.remote:
-                pool.remote[key] = _OpenAIBackend.from_env(cfg)
+                pool.remote[key] = _OpenAIBackend.from_env(cfg, meter)
             out[role] = LLMClient(cfg, pool.remote[key])
         elif cfg.endpoint == "local_hf":
             backend = pool.local_hf.get(cfg.model)
