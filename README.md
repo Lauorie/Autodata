@@ -181,8 +181,9 @@ With `models=flash`, at the gateway's list prices:
   would fail here (`final_filter.min_negative`).
 - **Training.** Full fine-tuning by default, to match lr 1e-6. 8
   completions per prompt is our choice. On one 85 GB card, a 65,536-token
-  rollout with a 248k vocabulary, full fine-tuning and a colocated vLLM do
-  not fit together. LoRA, a shorter budget, or a second card is needed.
+  rollout with a 248k vocabulary, full fine-tuning and a colocated vLLM
+  will not fit together. That is an estimate from tensor sizes, not a
+  measured run. LoRA, a shorter budget, or a second card is likely needed.
 - **Not built.** The CoT Self-Instruct baseline, its test set, and the
   legal-reasoning setting.
 

@@ -160,7 +160,8 @@ python scripts/train_grpo.py run_id=grpo1 train.data=<outputs_root>/data1/data/t
   "只用正向条目"的 rubric 在这里会被拦下（`final_filter.min_negative`）。
 - **训练。** 默认全参微调，与 lr 1e-6 相配。每题 8 条 completion 是我们
   自己定的。在一张 85 GB 的卡上，65,536 token 的 rollout、24.8 万的词表、
-  全参微调和同卡 vLLM 放不下。需要 LoRA、更短的上限，或者第二张卡。
+  全参微调和同卡 vLLM 放不下。这是按张量大小估算的，没有实测。多半需要
+  LoRA、更短的上限，或者第二张卡。
 - **没有实现。** CoT Self-Instruct 基线及其测试集，以及法律推理设定。
 
 ## 目录
