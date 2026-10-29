@@ -10,7 +10,8 @@ def setup_logging(level: str = "INFO") -> None:
     """Put one console handler (rich if available) on the root logger.
 
     File handlers stay: Hydra's writes the run log beside ``.hydra/``.
-    httpx logs every request at INFO; usage.jsonl already records each call.
+    httpx (httpx2 under openai>=3) logs every request at INFO; usage.jsonl
+    already records each call.
     """
     try:
         from rich.logging import RichHandler
@@ -25,7 +26,8 @@ def setup_logging(level: str = "INFO") -> None:
         root.removeHandler(h)
     root.addHandler(handler)
     root.setLevel(level.upper())
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    for name in ("httpx", "httpx2"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def get_logger(name: str) -> logging.Logger:

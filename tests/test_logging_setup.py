@@ -47,6 +47,7 @@ def test_setup_twice_keeps_one_console_handler(clean_root: logging.Logger) -> No
     assert len(consoles) == 1
 
 
-def test_http_client_chatter_stays_out(clean_root: logging.Logger) -> None:
+@pytest.mark.parametrize("name", ["httpx", "httpx2"])   # openai>=3 logs through httpx2
+def test_http_client_chatter_stays_out(clean_root: logging.Logger, name: str) -> None:
     setup_logging("INFO")
-    assert not logging.getLogger("httpx").isEnabledFor(logging.INFO)
+    assert not logging.getLogger(name).isEnabledFor(logging.INFO)
