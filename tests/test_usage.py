@@ -14,7 +14,7 @@ import pytest
 
 from autodata.llm.client import LLMRoleConfig, _OpenAIBackend, build_client_pool
 from autodata.llm.errors import OutputTruncatedError, PermanentLLMError
-from autodata.llm.usage import UsageMeter
+from autodata.llm.usage import UsageMeter, sum_usage_logs
 
 
 def _usage(prompt: int, completion: int, reasoning: int = 0, cached: int = 0) -> SimpleNamespace:
@@ -106,6 +106,18 @@ def test_each_call_is_appended_to_the_jsonl_log(tmp_path: Path) -> None:
     assert [r["role"] for r in rows] == ["judge", "strong_solver"]
     assert rows[0]["model"] == "ds-flash" and rows[0]["reasoning_tokens"] == 18
     assert rows[1]["finish_reason"] == "stop" and rows[1]["latency_s"] >= 0
+
+
+def test_logs_from_several_processes_sum_like_one_meter(tmp_path: Path) -> None:
+    one = UsageMeter()
+    for rank in (0, 1):
+        meter = UsageMeter(tmp_path / f"judge_usage.rank{rank}.jsonl")
+        for m in (meter, one):
+            m.record("judge", "ds-flash", _usage(10 + rank, 3, reasoning=2), latency_s=1.5,
+                     finish_reason="stop")
+            m.record("judge", "ds-flash", None, latency_s=0.5, finish_reason="stop")
+    paths = sorted(tmp_path.glob("judge_usage.rank*.jsonl"))
+    assert sum_usage_logs(paths) == one.totals()
 
 
 def test_concurrent_records_sum_exactly() -> None:

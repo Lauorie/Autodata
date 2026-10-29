@@ -6,12 +6,18 @@ alone (src/autodata/training/grpo.py). The paper trains Qwen3.5-4B with
 batch size 16 and learning rate 1e-6 and reports step 200.
 
 Writes, under <outputs_root>/<run_id>/grpo:
-    checkpoints, final/   the trained model (or LoRA adapter)
-    judge_usage.jsonl     one line per judge call
-    summary.json          settings and judge token totals
+    checkpoints, final/        the trained model (or LoRA adapter)
+    judge_usage.rank<N>.jsonl  one line per judge call, one file per process
+    summary.json               settings and judge token totals
+
+Full fine-tuning keeps fp32 weights and Adam state (TRL loads fp32 unless
+told otherwise; at lr 1e-6 bf16 weights would round most updates away).
+That is about 72 GB plus an fp32 reference model, so it is sharded with
+ZeRO-3 over two GPUs, each with its own colocated vLLM.
 
 Usage (needs the `train` and `serve` extras):
-    python scripts/train_grpo.py run_id=grpo1 train.data=<data>/train.jsonl
+    accelerate launch --config_file conf/accelerate/zero3.yaml \
+        scripts/train_grpo.py run_id=grpo1 train.data=<data>/train.jsonl
 """
 
 from __future__ import annotations
@@ -24,7 +30,7 @@ from dotenv import load_dotenv
 from omegaconf import DictConfig
 
 from autodata.config_runtime import build_client_pool, role_configs_from_dictconfig
-from autodata.llm import PromptSet, QAPair, UsageMeter
+from autodata.llm import PromptSet, QAPair, UsageMeter, sum_usage_logs
 from autodata.training import grpo_settings, make_reward_fn, solver_messages
 from autodata.utils import get_logger, load_jsonl, set_seed, setup_logging, write_json
 
@@ -35,7 +41,9 @@ logger = get_logger(__name__)
 def main(cfg: DictConfig) -> None:
     setup_logging("INFO")
     load_dotenv(dotenv_path=".secrets/remote.env", override=False)
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")    # TRL reports runs to the Hub
     set_seed(cfg.seed)
+    rank = int(os.environ.get("RANK", "0"))
     from datasets import Dataset
     from peft import LoraConfig
     from trl import GRPOConfig, GRPOTrainer
@@ -52,7 +60,7 @@ def main(cfg: DictConfig) -> None:
     out = Path(cfg.paths.outputs_root) / cfg.run_id / "grpo"
     out.mkdir(parents=True, exist_ok=True)
     roles = role_configs_from_dictconfig(cfg.models, cfg.solver_generation)
-    meter = UsageMeter(out / "judge_usage.jsonl")
+    meter = UsageMeter(out / f"judge_usage.rank{rank}.jsonl")
     judge = build_client_pool({"judge": roles["judge"]}, meter=meter)["judge"]
     reward_fn = make_reward_fn(dict(zip(ids, qas, strict=True)), judge, prompts,
                                thinking=bool(gen["thinking"]),
@@ -65,13 +73,13 @@ def main(cfg: DictConfig) -> None:
         **settings,
         max_steps=int(t.max_steps),
         learning_rate=float(t.learning_rate),
+        lr_scheduler_type=str(t.lr_scheduler),
         loss_type=str(t.loss_type),
         beta=float(t.beta),
-        vllm_mode="colocate",
-        vllm_gpu_memory_utilization=float(t.vllm_gpu_memory_utilization),
         bf16=True,
         gradient_checkpointing=True,
         save_steps=int(t.save_steps),
+        save_only_model=bool(t.save_only_model),
         logging_steps=int(t.logging_steps),
         report_to=[],
         remove_unused_columns=False,    # reward_fn reads the qa_id column
@@ -85,8 +93,12 @@ def main(cfg: DictConfig) -> None:
     logger.info("GRPO: %d questions, %s", len(qas), settings)
     trainer.train()
     trainer.save_model(str(out / "final"))
-    write_json(out / "summary.json", {"questions": len(qas), "settings": settings,
-                                      "lora_r": t.lora_r, "judge_usage": meter.totals()})
+    if trainer.accelerator.is_main_process:     # every rank has finished its judge calls
+        write_json(out / "summary.json", {
+            "questions": len(qas), "settings": settings, "lora_r": t.lora_r,
+            "world_size": trainer.accelerator.num_processes,
+            "judge_usage": sum_usage_logs(sorted(out.glob("judge_usage.rank*.jsonl"))),
+        })
     logger.info("GRPO done -> %s", out / "final")
 
 

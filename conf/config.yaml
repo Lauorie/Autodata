@@ -29,8 +29,10 @@ inner_loop:
   infra_retries: 2
 
 # One generation setting for both solvers, applied in code to weak and strong.
-# GRPO rollouts and evaluation (step 6) must read these same values: the weak
-# solver's budget decides which questions the loop accepts.
+# Evaluation reads all of it: the weak solver's budget decides which questions
+# the loop accepts. GRPO rollouts share thinking, max_tokens and temperature
+# but sample the raw policy; top_p, top_k and presence_penalty are decode-time
+# choices that would break the importance ratio (training/grpo.py).
 solver_generation:
   thinking: true            # Qwen3.5 thinks by default; the paper treats the 4B as a reasoning model
   max_tokens: 65536         # thinking + answer; paper App A reasoning budget for Qwen3.5-4B
@@ -83,26 +85,36 @@ meta:
   edit_retries: 2           # re-asks of the implementer after an unusable reply
   workers: 4                # sessions in parallel within one evaluation
 
-# GRPO on the solver (Sec 3.1.2). Rollouts take the solver_generation block:
-# the same thinking, budget and sampling as the weak solver in the loop.
-# scripts/train_grpo.py.
+# GRPO on the solver (Sec 3.1.2). Rollouts take thinking, budget and
+# temperature from solver_generation and sample the raw policy.
+# scripts/train_grpo.py, launched with conf/accelerate/zero3.yaml.
 train:
   data: null                # train.jsonl from scripts/build_dataset.py
   prompts_per_step: 16      # the paper's batch size 16, read as prompts per step
   num_generations: 8        # completions per prompt; the paper gives no number
-  per_device_batch: 8       # completions per forward pass; sets gradient accumulation
+  per_device_batch: 2       # completions per forward pass; sets gradient accumulation
   max_steps: 200            # Table 2 reports step 200
   learning_rate: 1e-6       # the paper's value, for full fine-tuning
+  lr_scheduler: constant    # the paper gives one rate; a linear decay would reach 0 at step 200
   # null trains every weight, as the paper's learning rate suggests. A LoRA
   # rank (e.g. 16) fits one GPU but learns little at 1e-6: raise the rate.
   lora_r: null
   loss_type: grpo           # the paper cites GRPO (Shao et al.); TRL defaults to dapo
   beta: 0.04                # KL coefficient of Shao et al.; TRL defaults to 0
-  use_vllm: true            # 65k-token rollouts and presence_penalty need vLLM
-  vllm_gpu_memory_utilization: 0.35
+  use_vllm: true            # 65k-token rollouts need vLLM
+  vllm_gpu_memory_utilization: 0.35   # share of each training GPU for its colocated vLLM
+  vllm_sleep: true          # free that share for the backward pass
+  # Correction for vLLM vs trainer logprobs. TRL's default, sequence_mask,
+  # multiplies a few thousand per-token ratios and masks most long completions.
+  vllm_is_mode: token_truncate
   max_prompt_tokens: 8192   # room for the solver system prompt, context and question
-  judge_workers: 16         # judge calls in parallel per reward batch
+  # Judge calls in parallel per process. 64 grades a process's share of a
+  # step (16 x 8 / 2) in one wave; at 16 the GPUs sat idle 24% of a step.
+  judge_workers: 64
   save_steps: 50
+  # A full checkpoint (fp32 weights and Adam state) is about 54 GB; the
+  # shared disk on the run box cannot hold several. Save weights only.
+  save_only_model: true
   logging_steps: 5
 
 hydra:

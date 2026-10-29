@@ -20,7 +20,8 @@ SEED = PromptSet.seed()
 GEN = {"thinking": True, "max_tokens": 65536, "temperature": 1.0, "top_p": 0.95, "top_k": 20,
        "presence_penalty": 1.5}
 TRAIN = {"prompts_per_step": 16, "num_generations": 8, "per_device_batch": 8,
-         "use_vllm": True, "max_prompt_tokens": 8192}
+         "use_vllm": True, "max_prompt_tokens": 8192, "vllm_gpu_memory_utilization": 0.35,
+         "vllm_sleep": True, "vllm_is_mode": "token_truncate"}
 
 
 def test_prompt_is_the_solver_chat() -> None:
@@ -86,24 +87,39 @@ def test_reward_needs_the_question_id() -> None:
 
 # -- the trainer settings ----------------------------------------------------------
 
-def test_rollouts_use_the_solver_generation_block() -> None:
+def test_rollouts_share_the_budget_and_thinking() -> None:
     s = grpo_settings(GEN, TRAIN, world_size=1)
     assert s["max_completion_length"] == 65536
-    assert (s["temperature"], s["top_p"], s["top_k"]) == (1.0, 0.95, 20)
+    assert s["temperature"] == 1.0
     assert s["chat_template_kwargs"] == {"enable_thinking": True}
-    assert s["generation_kwargs"] == {"presence_penalty": 1.5}
     assert s["vllm_max_model_length"] == 65536 + 8192
 
 
-def test_presence_penalty_needs_vllm() -> None:
-    with pytest.raises(ValueError, match="presence_penalty"):
-        grpo_settings(GEN, {**TRAIN, "use_vllm": False}, world_size=1)
+def test_rollouts_sample_the_policy_itself() -> None:
+    # vLLM reports processed logprobs: a presence penalty or top-k/top-p cut
+    # would move them off the trainer's logits/T and the importance ratio
+    # would mask every long completion. Those stay decode-time choices for
+    # the loop and the held-out eval.
+    s = grpo_settings(GEN, TRAIN, world_size=1)
+    assert not {"top_p", "top_k", "generation_kwargs"} & s.keys()
+
+
+def test_importance_sampling_mode_follows_the_config() -> None:
+    s = grpo_settings(GEN, {**TRAIN, "vllm_is_mode": "token_truncate"}, world_size=1)
+    assert s["vllm_importance_sampling_mode"] == "token_truncate"
 
 
 def test_batch_is_counted_in_prompts() -> None:
     s = grpo_settings(GEN, TRAIN, world_size=1)
     assert s["per_device_train_batch_size"] * s["gradient_accumulation_steps"] == 16 * 8
     assert s["num_generations"] == 8
+
+
+def test_colocated_vllm_follows_the_config() -> None:
+    s = grpo_settings(GEN, {**TRAIN, "vllm_gpu_memory_utilization": 0.3, "vllm_sleep": False},
+                      world_size=2)
+    assert s["vllm_mode"] == "colocate"
+    assert (s["vllm_gpu_memory_utilization"], s["vllm_enable_sleep_mode"]) == (0.3, False)
 
 
 def test_uneven_batch_is_refused() -> None:

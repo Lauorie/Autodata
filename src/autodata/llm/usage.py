@@ -5,13 +5,15 @@ reply or an empty one that gets retried still spent its tokens. A request
 that failed outright returned no usage and is not counted.
 
 ``UsageMeter(path)`` appends one JSON line per call to ``path``; ``totals()``
-sums them per role. Price is left out: it lives with the gateway, not here.
+sums them per role. ``sum_usage_logs`` sums the logs of several processes
+the same way. Price is left out: it lives with the gateway, not here.
 """
 
 from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,17 @@ def _tokens(usage: Any) -> dict[str, int]:
     return {k: int(v or 0) for k, v in raw.items()}
 
 
+def _add(totals: dict[str, dict[str, Any]], row: dict[str, Any]) -> None:
+    """Fold one logged call into per-role totals."""
+    t = totals.setdefault(row["role"], {"model": row["model"], "calls": 0, "usage_missing": 0,
+                                        "latency_s": 0.0, **dict.fromkeys(_FIELDS, 0)})
+    t["calls"] += 1
+    t["usage_missing"] += bool(row["usage_missing"])
+    t["latency_s"] += row["latency_s"]
+    for k in _FIELDS:
+        t[k] += row[k]
+
+
 class UsageMeter:
     """Thread-safe call log and per-role totals."""
 
@@ -41,17 +54,10 @@ class UsageMeter:
 
     def record(self, role: str, model: str, usage: Any, latency_s: float,
                finish_reason: str | None) -> None:
-        tokens = _tokens(usage)
-        row = {"role": role, "model": model, **tokens,
+        row = {"role": role, "model": model, **_tokens(usage), "usage_missing": usage is None,
                "latency_s": round(latency_s, 3), "finish_reason": finish_reason}
         with self._lock:
-            t = self._totals.setdefault(role, {"model": model, "calls": 0, "usage_missing": 0,
-                                               "latency_s": 0.0, **dict.fromkeys(_FIELDS, 0)})
-            t["calls"] += 1
-            t["usage_missing"] += usage is None
-            t["latency_s"] += latency_s
-            for k in _FIELDS:
-                t[k] += tokens[k]
+            _add(self._totals, row)
             if self._path is not None:
                 with self._path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(row) + "\n")
@@ -61,4 +67,15 @@ class UsageMeter:
             return {role: dict(t) for role, t in self._totals.items()}
 
 
-__all__ = ["UsageMeter"]
+def sum_usage_logs(paths: Iterable[str | Path]) -> dict[str, dict[str, Any]]:
+    """Per-role totals over call logs, e.g. one per training process."""
+    totals: dict[str, dict[str, Any]] = {}
+    for path in paths:
+        with Path(path).open(encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    _add(totals, json.loads(line))
+    return totals
+
+
+__all__ = ["UsageMeter", "sum_usage_logs"]

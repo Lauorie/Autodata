@@ -1,9 +1,10 @@
 """GRPO pieces that do not need TRL (arXiv 2606.25996, Sec 3.1.2).
 
 The loop accepted each question because the weak solver, answering with the
-``solver_generation`` settings, scored low on it. GRPO rollouts use those
-same settings: the solver system prompt under the chat template, the
-thinking switch, the token budget and the sampling. The reward is the
+``solver_generation`` settings, scored low on it. GRPO rollouts keep the
+solver system prompt under the chat template, the thinking switch, the
+token budget and the temperature; they sample the raw policy (see
+``grpo_settings``). The reward is the
 loop's judge on the answer alone, as vLLM's reasoning parser hands it over
 in the loop:
 
@@ -88,13 +89,16 @@ def grpo_settings(gen: Mapping[str, Any], train: Mapping[str, Any],
                   world_size: int) -> dict[str, Any]:
     """GRPOConfig fields fixed by ``solver_generation`` and the batch shape.
 
+    Rollouts share the loop's thinking switch, token budget and temperature,
+    and sample the policy itself: no top-k/top-p cut, no presence penalty.
+    vLLM reports processed logprobs, so any such tweak would move them off
+    the trainer's logits/T, and the importance ratio over a few thousand
+    tokens would mask the completion. Those stay decode-time choices for the
+    loop and the held-out eval.
+
     The batch is counted in prompts per optimizer step; gradient
     accumulation makes up the difference.
     """
-    presence = gen.get("presence_penalty")
-    if presence is not None and not train["use_vllm"]:
-        raise ValueError("presence_penalty needs use_vllm: transformers generation has none, "
-                         "and dropping it would change the solver's sampling")
     completions = int(train["prompts_per_step"]) * int(train["num_generations"])
     per_pass = int(train["per_device_batch"]) * world_size
     if completions % per_pass:
@@ -106,15 +110,19 @@ def grpo_settings(gen: Mapping[str, Any], train: Mapping[str, Any],
         "num_generations": int(train["num_generations"]),
         "max_completion_length": int(gen["max_tokens"]),
         "temperature": float(gen["temperature"]),
-        "top_p": float(gen["top_p"]) if gen.get("top_p") is not None else 1.0,
-        "top_k": int(gen["top_k"]) if gen.get("top_k") is not None else 0,
         "chat_template_kwargs": {"enable_thinking": bool(gen["thinking"])},
         "use_vllm": bool(train["use_vllm"]),
     }
-    if presence is not None:
-        settings["generation_kwargs"] = {"presence_penalty": float(presence)}
     if train["use_vllm"]:
-        settings["vllm_max_model_length"] = int(gen["max_tokens"]) + int(train["max_prompt_tokens"])
+        # Each training GPU hosts its own vLLM engine. Asleep, the engine hands
+        # its weights and KV cache back for the backward pass.
+        settings.update(
+            vllm_mode="colocate",
+            vllm_max_model_length=int(gen["max_tokens"]) + int(train["max_prompt_tokens"]),
+            vllm_gpu_memory_utilization=float(train["vllm_gpu_memory_utilization"]),
+            vllm_enable_sleep_mode=bool(train["vllm_sleep"]),
+            vllm_importance_sampling_mode=str(train["vllm_is_mode"]),
+        )
     return settings
 
 

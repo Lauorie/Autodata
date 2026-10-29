@@ -10,7 +10,7 @@ from .errors import (
 )
 from .prompt_set import PromptSet
 from .schemas import QAPair, RubricCriterion, RubricSpec, SolverScore, VerifierVerdict
-from .usage import UsageMeter
+from .usage import UsageMeter, sum_usage_logs
 
 __all__ = [
     "ContextLengthError",
@@ -28,4 +28,5 @@ __all__ = [
     "UsageMeter",
     "VerifierVerdict",
     "build_client_pool",
+    "sum_usage_logs",
 ]
