@@ -12,7 +12,7 @@ rewrites the agent's own prompts.
 
 ## Status
 
-Everything below runs and is tested (241 tests). What has run live, and
+Everything below runs and is tested (245 tests). What has run live, and
 what has not:
 
 | Stage | Live run | Result |
@@ -21,7 +21,7 @@ what has not:
 | Inner loop, default models | smoke, 1 paper, 2 rounds | both rounds `failed_on_strong` |
 | Held-out eval | 2 gate questions | base mean@3 0.279, best@3 0.309 (a plumbing check, not a result) |
 | Meta-optimization | trial, 1 iteration, 10 validation sessions per side | seed 2/10, mutant 5/10 at the fixed filter (see below) |
-| GRPO training | never run | settings checked against the TRL 1.16 source only |
+| GRPO training | smoke, 2 steps at the real batch shape (16 × 8), 24 questions, 2 GPUs | gradient flows (KL 5e-4 at step 2); 13–14.5 min and about $0.15 of judge calls per step |
 
 Accepted gate questions: weak 0.20–0.49, strong 0.60–0.85, gap 0.33–0.42.
 
@@ -112,10 +112,14 @@ leave the denominator. Below 80% scored, the evaluation is void.
 - `eval_solver.py` answers each test question 3 times with the weak
   solver's settings and reports mean@3 and best@3. A question with a sample
   lost to the gateway is left out and counted.
-- `train_grpo.py` runs GRPO through TRL with the same chat prompt, thinking
-  switch, budget and sampling as the loop's weak solver. The reward is the
+- `train_grpo.py` runs GRPO through TRL with the loop's chat prompt,
+  thinking switch, budget and temperature. Rollouts sample the raw policy:
+  no top-k/top-p cut and no presence penalty, because TRL corrects for the
+  gap between vLLM's processed logprobs and the trainer's, and those
+  tweaks widen it until every completion is masked. The reward is the
   loop's judge on the answer. A judge failure returns no reward, not zero.
-  16 prompts per step, lr 1e-6, 200 steps, KL 0.04.
+  16 prompts × 8 completions per step, constant lr 1e-6, 200 steps,
+  KL 0.04, token-level truncated importance sampling.
 
 ## Running
 
@@ -136,7 +140,8 @@ python scripts/run_inner_loop.py run_id=gate run.papers_limit=5 models=flash
 python scripts/build_dataset.py run_id=data1 'data.runs=[<outputs_root>/gate]'
 python scripts/eval_solver.py run_id=data1 eval.test_set=<outputs_root>/data1/data/test.jsonl
 python scripts/run_meta.py run_id=meta1 models=flash meta.iterations=2
-python scripts/train_grpo.py run_id=grpo1 train.data=<outputs_root>/data1/data/train.jsonl
+CUDA_VISIBLE_DEVICES=2,3 accelerate launch --config_file conf/accelerate/zero3.yaml \
+    scripts/train_grpo.py run_id=grpo1 train.data=<outputs_root>/data1/data/train.jsonl
 ```
 
 Each run writes to `<outputs_root>/<run_id>/`, with its Hydra config and
@@ -160,6 +165,10 @@ With `models=flash`, at the gateway's list prices:
   mutant) should cost about $5 and 7 hours per iteration at
   `meta.workers=4`; that is an estimate. The strong solver takes most of
   the time.
+- GRPO: 13–14.5 minutes per step on two RTX 6000D cards, measured over 2
+  steps; 200 steps would take about 45 hours. Completions averaged 5.5k–6k
+  tokens, the longest 12k, none cut at the budget. The judge cost about
+  $0.15 per step.
 
 ## Where this differs from the paper
 
@@ -179,18 +188,22 @@ With `models=flash`, at the gateway's list prices:
   the seed verifier and Fig 9's counts. The counts demand 3 negative
   criteria, so a positive-only rubric, one of the paper's Sec 4 findings,
   would fail here (`final_filter.min_negative`).
-- **Training.** Full fine-tuning by default, to match lr 1e-6. 8
-  completions per prompt is our choice. On one 85 GB card, a 65,536-token
-  rollout with a 248k vocabulary, full fine-tuning and a colocated vLLM
-  will not fit together. That is an estimate from tensor sizes, not a
-  measured run. LoRA, a shorter budget, or a second card is likely needed.
+- **Training.** Full fine-tuning, to match lr 1e-6, with fp32 weights and
+  Adam state: in bf16 most updates at that rate would round away. With an
+  fp32 reference model that does not fit one 85 GB card (a one-card smoke
+  ran out of memory), so ZeRO-3 shards it over two, each with a colocated
+  vLLM that sleeps during the backward pass; the peak was 72 GB per card.
+  8 completions per prompt and the constant rate are our choices.
+  Rollouts drop the loop's top-k, top-p and presence penalty (see above).
+  Checkpoints keep weights only; a full one is about 54 GB.
 - **Not built.** The CoT Self-Instruct baseline, its test set, and the
   legal-reasoning setting.
 
 ## Layout
 
 ```
-conf/                    Hydra config: config.yaml, models/, acceptance/
+conf/                    Hydra config: config.yaml, models/, acceptance/;
+                         accelerate/zero3.yaml for GRPO
 scripts/                 run_inner_loop, run_meta, build_dataset, eval_solver,
                          train_grpo, serve_weak_solver, sync_*
 src/autodata/

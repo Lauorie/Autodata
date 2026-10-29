@@ -10,7 +10,7 @@ synthetic data*（Kulikov et al.，arXiv:2606.25996）中的 CS 论文设定。
 
 ## 现状
 
-下面每个环节都能运行，有测试覆盖（241 个）。哪些真实跑过，哪些没有：
+下面每个环节都能运行，有测试覆盖（245 个）。哪些真实跑过，哪些没有：
 
 | 环节 | 真实运行 | 结果 |
 |---|---|---|
@@ -18,7 +18,7 @@ synthetic data*（Kulikov et al.，arXiv:2606.25996）中的 CS 论文设定。
 | 内循环，默认模型 | smoke，1 篇论文，2 轮 | 两轮都是 `failed_on_strong` |
 | 测试集评测 | gate 的 2 道题 | base mean@3 0.279，best@3 0.309（只验证流程，不算结果） |
 | Meta 优化 | 试验，1 轮迭代，每边 10 个验证 session | 按固定过滤器计：种子 2/10，子代 5/10（见下） |
-| GRPO 训练 | 没跑过 | 参数只对照 TRL 1.16 源码核对过 |
+| GRPO 训练 | 冒烟测试，真实 batch 形状（16 × 8）跑 2 步，24 道题，2 张卡 | 梯度正常（第 2 步 KL 5e-4）；每步 13–14.5 分钟，judge 约 $0.15 |
 
 gate 中被接受的题：弱 0.20–0.49，强 0.60–0.85，差距 0.33–0.42。
 
@@ -99,9 +99,12 @@ prompt 是量尺，固定不动；user 消息的框架也固定。用 `prompts_d
 - `eval_solver.py` 用弱 solver 的设置把每道测试题答 3 次，报告 mean@3
   和 best@3。某次作答因网关故障丢失，这道题不计分，单独记数。
 - `train_grpo.py` 通过 TRL 跑 GRPO。chat prompt、thinking 开关、token
-  上限和采样参数都与 loop 中的弱 solver 一致。reward 是 loop 的 judge
-  对答案的打分。judge 出错时不给 reward，而不是给 0。每步 16 道题，
-  lr 1e-6，200 步，KL 0.04。
+  上限和温度与 loop 中的弱 solver 一致。rollout 直接从策略本身采样，
+  不做 top-k/top-p 截断，不加 presence penalty：TRL 会校正 vLLM 的
+  processed logprob 与训练端 logprob 之间的差，这些处理会把差拉大，
+  直到每条回答都被屏蔽。reward 是 loop 的 judge 对答案的打分。judge
+  出错时不给 reward，而不是给 0。每步 16 道题 × 8 条回答，lr 恒定 1e-6，
+  200 步，KL 0.04，逐 token 截断的重要性采样。
 
 ## 运行
 
@@ -122,7 +125,8 @@ python scripts/run_inner_loop.py run_id=gate run.papers_limit=5 models=flash
 python scripts/build_dataset.py run_id=data1 'data.runs=[<outputs_root>/gate]'
 python scripts/eval_solver.py run_id=data1 eval.test_set=<outputs_root>/data1/data/test.jsonl
 python scripts/run_meta.py run_id=meta1 models=flash meta.iterations=2
-python scripts/train_grpo.py run_id=grpo1 train.data=<outputs_root>/data1/data/train.jsonl
+CUDA_VISIBLE_DEVICES=2,3 accelerate launch --config_file conf/accelerate/zero3.yaml \
+    scripts/train_grpo.py run_id=grpo1 train.data=<outputs_root>/data1/data/train.jsonl
 ```
 
 每次运行写到 `<outputs_root>/<run_id>/`，里面有 Hydra 配置和运行日志。
@@ -143,6 +147,9 @@ python scripts/train_grpo.py run_id=grpo1 train.data=<outputs_root>/data1/data/t
   96 分钟、$0.54，`meta.workers=10`。默认配置（5 篇训练论文，25 篇验证
   论文 × 4 个样本，父代和子代各一遍）在 `meta.workers=4` 下估计每轮
   约 $5、7 小时，这是估算。大部分时间花在强 solver 上。
+- GRPO：两张 RTX 6000D 上每步 13–14.5 分钟，按 2 步实测；200 步约 45
+  小时。回答平均 5.5k–6k token，最长 12k，没有一条被截断。judge 每步
+  约 $0.15。
 
 ## 与论文的差异
 
@@ -158,16 +165,19 @@ python scripts/train_grpo.py run_id=grpo1 train.data=<outputs_root>/data1/data/t
 - **最终过滤器。** 论文没有给出它的过滤 prompt。我们沿用种子 verifier 和
   Fig 9 的条目数规则。规则要求至少 3 条负向条目，因此论文 Sec 4 发现的
   "只用正向条目"的 rubric 在这里会被拦下（`final_filter.min_negative`）。
-- **训练。** 默认全参微调，与 lr 1e-6 相配。每题 8 条 completion 是我们
-  自己定的。在一张 85 GB 的卡上，65,536 token 的 rollout、24.8 万的词表、
-  全参微调和同卡 vLLM 放不下。这是按张量大小估算的，没有实测。多半需要
-  LoRA、更短的上限，或者第二张卡。
+- **训练。** 全参微调，与 lr 1e-6 相配。权重和 Adam 状态用 fp32：在
+  bf16 下，这个学习率的大部分更新会被舍入掉。加上 fp32 的参考模型，
+  一张 85 GB 的卡放不下（单卡冒烟测试 OOM），所以用 ZeRO-3 分到两张卡，
+  每张卡各带一个同卡 vLLM，反向传播时休眠；峰值每卡 72 GB。每题 8 条
+  回答和恒定学习率是我们自己定的。rollout 去掉了 loop 的 top-k、top-p
+  和 presence penalty（见上）。checkpoint 只存权重，完整的约 54 GB。
 - **没有实现。** CoT Self-Instruct 基线及其测试集，以及法律推理设定。
 
 ## 目录
 
 ```
-conf/                    Hydra 配置：config.yaml、models/、acceptance/
+conf/                    Hydra 配置：config.yaml、models/、acceptance/；
+                         GRPO 用的 accelerate/zero3.yaml
 scripts/                 run_inner_loop、run_meta、build_dataset、eval_solver、
                          train_grpo、serve_weak_solver、sync_*
 src/autodata/
