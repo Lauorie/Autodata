@@ -213,6 +213,6 @@ src/autodata/
   meta/                  outer_loop, evaluation, digest, analyzer, implementer,
                          population, history
   data_module/           paper_loader, qa_dataset, arxiv_html
-  training/              grpo (rollout settings and reward)
+  training/              grpo (rollout settings and reward), export
 tests/                   fakes.py drives every agent without a network
 ```

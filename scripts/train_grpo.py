@@ -31,7 +31,7 @@ from omegaconf import DictConfig
 
 from autodata.config_runtime import build_client_pool, role_configs_from_dictconfig
 from autodata.llm import PromptSet, QAPair, UsageMeter, sum_usage_logs
-from autodata.training import grpo_settings, make_reward_fn, solver_messages
+from autodata.training import complete_export, grpo_settings, make_reward_fn, solver_messages
 from autodata.utils import get_logger, load_jsonl, set_seed, setup_logging, write_json
 
 logger = get_logger(__name__)
@@ -94,6 +94,8 @@ def main(cfg: DictConfig) -> None:
     trainer.train()
     trainer.save_model(str(out / "final"))
     if trainer.accelerator.is_main_process:     # every rank has finished its judge calls
+        if not t.lora_r:                        # an adapter directory takes no base files
+            complete_export(cfg.paths.qwen_model_dir, out / "final")
         write_json(out / "summary.json", {
             "questions": len(qas), "settings": settings, "lora_r": t.lora_r,
             "world_size": trainer.accelerator.num_processes,

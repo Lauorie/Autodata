@@ -187,6 +187,6 @@ src/autodata/
   meta/                  outer_loop、evaluation、digest、analyzer、implementer、
                          population、history
   data_module/           paper_loader、qa_dataset、arxiv_html
-  training/              grpo（rollout 设置与 reward）
+  training/              grpo（rollout 设置与 reward）、export
 tests/                   fakes.py 在不联网的情况下驱动每个 agent
 ```
