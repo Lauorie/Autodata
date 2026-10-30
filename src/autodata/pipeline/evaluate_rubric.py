@@ -20,97 +20,159 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from ..llm import LLMClient, QAPair, SolverScore
-from ..llm import prompts as _prompts_module    # late-bound
 from ..llm.client import extract_json
+from ..llm.errors import OutputTruncatedError
+from ..llm.prompt_set import PromptSet
 
 logger = logging.getLogger(__name__)
 
 
-def weighted_average(per_criterion: Sequence[float], weights: Sequence[int]) -> float:
-    if not per_criterion:
-        return 0.0
+def rubric_score(per_criterion: Sequence[float], weights: Sequence[int]) -> float:
+    """Signed-weight rubric score in [0, 1].
+
+    Positive items add ``w * s``, negative items (``w < 0``) subtract when the
+    answer makes the error. The sum is divided by the positive-weight total
+    and clipped at 0: the clipped PRBench form the paper reports (Table 4).
+    """
     if len(per_criterion) != len(weights):
-        # Truncate / pad-with-zeros to length-match. We treat missing scores as 0.
-        n = min(len(per_criterion), len(weights))
-        per_criterion = list(per_criterion[:n]) + [0.0] * (len(weights) - n)
-    total_w = sum(weights) or 1
-    return sum(s * w for s, w in zip(per_criterion, weights, strict=False)) / total_w
+        raise ValueError(f"{len(per_criterion)} scores for {len(weights)} rubric items")
+    max_score = sum(w for w in weights if w > 0)
+    if max_score == 0:
+        return 0.0
+    raw = sum(s * w for s, w in zip(per_criterion, weights, strict=True))
+    return max(0.0, raw / max_score)
 
 
-def _ask_solver(solver: LLMClient, qa: QAPair) -> str:
-    return solver.chat([
-        {"role": "system", "content": _prompts_module.SOLVER_SYSTEM},
-        {"role": "user", "content": _prompts_module.solver_user(qa.context, qa.question)},
-    ])
+def _ask_solver(solver: LLMClient, qa: QAPair, prompts: PromptSet) -> tuple[str, bool]:
+    """Return ``(answer, truncated)``. A reply cut at the token budget is the
+    model's own failure (paper App A): keep whatever answer it reached."""
+    try:
+        return solver.chat([
+            {"role": "system", "content": prompts.solver_system},
+            {"role": "user", "content": prompts.render_solver(qa.context, qa.question)},
+        ]), False
+    except OutputTruncatedError as e:
+        return e.partial, True
 
 
-_JUDGE_SCORE_TOLERANCE = 0.25  # > tolerance outside [0,1] -> fail-closed
+_JUDGE_SCORE_TOLERANCE = 0.25  # scores this far outside [0, 1] are unusable
 
 
 def _normalise_judge_scores(raw_scores: list[float], expected_n: int) -> list[float]:
-    """Length-align to ``expected_n`` and clamp scores to [0, 1].
+    """Check the judge returned one usable score per rubric item; clamp to [0, 1].
 
-    Fails CLOSED (returns all zeros) if any score is grossly outside the
-    allowed range — a judge that emits 2.5 or -0.4 is signalling confusion,
-    and we don't want to silently turn that into a "good" 1.0 score that
-    could let a bad QA through acceptance.
+    Raises ValueError on a wrong count, a non-number, or a score grossly
+    outside [0, 1]: such a judge is confused, and guessing (padding with
+    zeros, truncating, zeroing) would mis-score the answer.
     """
+    if len(raw_scores) != expected_n:
+        raise ValueError(f"got {len(raw_scores)} scores for {expected_n} rubric items")
     floats: list[float] = []
     for s in raw_scores:
         try:
             floats.append(float(s))
-        except (TypeError, ValueError):
-            return [0.0] * expected_n
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"score {s!r} is not a number") from e
     for s in floats:
         if s < (0.0 - _JUDGE_SCORE_TOLERANCE) or s > (1.0 + _JUDGE_SCORE_TOLERANCE):
-            return [0.0] * expected_n
-    clamped = [max(0.0, min(1.0, s)) for s in floats]
-    if len(clamped) < expected_n:
-        clamped = clamped + [0.0] * (expected_n - len(clamped))
-    elif len(clamped) > expected_n:
-        clamped = clamped[:expected_n]
-    return clamped
+            raise ValueError(f"score {s} is outside [0, 1]")
+    return [max(0.0, min(1.0, s)) for s in floats]
 
 
-def _ask_judge(judge: LLMClient, qa: QAPair, candidate: str) -> tuple[list[float], str]:
-    rubric_json = json.dumps(qa.rubric.model_dump(), ensure_ascii=False)
-    raw = judge.chat([
-        {"role": "system", "content": _prompts_module.JUDGE_SYSTEM},
-        {"role": "user", "content": _prompts_module.judge_user(
-            qa.question, qa.reference_answer, candidate, rubric_json)},
-    ])
+class JudgeOutputError(ValueError):
+    """The judge never returned a usable per-criterion score list."""
+
+
+def _parse_judge(raw: str, n_crit: int) -> tuple[list[float], str]:
+    obj = extract_json(raw)
+    if not isinstance(obj, dict):
+        raise ValueError(f"expected a JSON object, got {type(obj).__name__}")
+    raw_scores = obj.get("per_criterion")
+    if not isinstance(raw_scores, list):
+        raise ValueError(f"per_criterion is not a list: {type(raw_scores).__name__}")
+    return _normalise_judge_scores(raw_scores, n_crit), str(obj.get("feedback", ""))
+
+
+def judge_answer(judge: LLMClient, qa: QAPair, candidate: str,
+                 retries: int = 0, *, prompts: PromptSet) -> tuple[list[float], str]:
+    """Grade one answer; re-ask up to ``retries`` times, naming the problem.
+
+    The judge never sees the reference answer (paper Sec 3.1). A reply cut
+    at ``max_tokens`` is not re-asked: the same prompt hits the same cap.
+    """
     n_crit = len(qa.rubric.criteria)
-    try:
-        obj = extract_json(raw)
-        raw_scores = obj.get("per_criterion", [])
-        if not isinstance(raw_scores, list):
-            raise ValueError(f"per_criterion is not a list: {type(raw_scores).__name__}")
-        per = _normalise_judge_scores(raw_scores, n_crit)
-        fb = str(obj.get("feedback", ""))
-        return per, fb
-    except Exception as e:
-        logger.warning("judge parse failed: %s -- raw=%r", e, raw[:200])
-        # treat parse failure as a zero score (don't credit broken evals)
-        return [0.0] * n_crit, f"PARSE_FAIL: {e}"
+    base = [
+        {"role": "system", "content": prompts.judge_system},
+        {"role": "user", "content": prompts.render_judge(
+            qa.context, qa.question, candidate, qa.rubric.to_prompt_json())},
+    ]
+    messages = base
+    for attempt in range(retries + 1):
+        try:
+            raw = judge.chat(messages)
+        except OutputTruncatedError as e:
+            raise JudgeOutputError(str(e)) from e
+        try:
+            return _parse_judge(raw, n_crit)
+        except ValueError as e:
+            logger.warning("judge reply unusable (attempt %d): %s -- raw=%r", attempt, e, raw[:200])
+            last = e
+            messages = base + [
+                {"role": "assistant", "content": raw},
+                {"role": "user", "content": (
+                    f"Your reply could not be used ({e}). Reply ONLY with the JSON object; "
+                    f"per_criterion must hold exactly {n_crit} numbers in [0, 1], in rubric order."
+                )},
+            ]
+    raise JudgeOutputError(f"no usable judge reply after {retries + 1} attempts: {last}")
 
 
-def _score_one(solver: LLMClient, judge: LLMClient,
-               qa: QAPair, weights: list[int], idx: int) -> SolverScore:
+_SOLVER_ERROR = "solver_error"   # judge_feedback prefix of a sample worth re-running
+
+
+def _infra_failure(answer: str, n_crit: int, reason: str) -> SolverScore:
+    return SolverScore(answer=answer, per_criterion=[0.0] * n_crit, weighted_score=0.0,
+                       judge_feedback=reason, infra_error=True)
+
+
+def _score_one(solver: LLMClient, judge: LLMClient, qa: QAPair,
+               weights: list[int], idx: int, retries: int, prompts: PromptSet) -> SolverScore:
+    # Fig 7: SOLVER_ERROR or an empty response is an infrastructure failure,
+    # flagged so the loop never reads it as a low score.
     try:
-        ans = _ask_solver(solver, qa)
+        ans, truncated = _ask_solver(solver, qa, prompts)
     except Exception as e:
         logger.warning("solver call failed sample %d: %s", idx, e)
-        return SolverScore(answer=f"ERROR: {e}",
-                           per_criterion=[0.0] * len(weights),
-                           weighted_score=0.0,
-                           judge_feedback="solver_error")
-    per, fb = _ask_judge(judge, qa, ans)
+        return _infra_failure(f"ERROR: {e}", len(weights), _SOLVER_ERROR)
+    if not ans.strip():
+        if truncated:
+            return SolverScore(answer="", per_criterion=[0.0] * len(weights), weighted_score=0.0,
+                               judge_feedback="no answer: the token budget ran out first",
+                               truncated=True)
+        return _infra_failure(ans, len(weights), f"{_SOLVER_ERROR}: empty response")
+    try:
+        per, fb = judge_answer(judge, qa, ans, retries, prompts=prompts)
+    except JudgeOutputError as e:
+        return _infra_failure(ans, len(weights), f"PARSE_FAIL: {e}")
     return SolverScore(
         answer=ans,
         per_criterion=per,
-        weighted_score=weighted_average(per, weights),
+        weighted_score=rubric_score(per, weights),
         judge_feedback=fb,
+        truncated=truncated,
     )
+
+
+def _run_samples(solver: LLMClient, judge: LLMClient, qa: QAPair, idxs: list[int],
+                 parallel: bool, retries: int, prompts: PromptSet) -> list[SolverScore]:
+    weights = qa.rubric.weights
+    if not parallel or len(idxs) <= 1:
+        return [_score_one(solver, judge, qa, weights, i, retries, prompts) for i in idxs]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=len(idxs)) as pool:
+        futures = [pool.submit(_score_one, solver, judge, qa, weights, i, retries, prompts)
+                   for i in idxs]
+        return [f.result() for f in futures]
 
 
 def score_solver(
@@ -119,21 +181,31 @@ def score_solver(
     qa: QAPair,
     n_samples: int = 3,
     parallel: bool = True,
+    retries: int = 0,
+    *,
+    prompts: PromptSet,
 ) -> list[SolverScore]:
     """Run `n_samples` solver attempts and grade each with the judge.
 
+    Samples whose solver call failed are run again, up to ``retries`` times,
+    on the same question (Fig 7: retry the eval, do not refine the question).
+    A judge failure re-asks only the judge, up to ``retries`` times, and keeps
+    the answer: re-running the solver would buy a new answer for nothing.
+
     When ``parallel`` is True the samples are issued concurrently via a
-    ThreadPoolExecutor — this is safe because the proxy backend is just an
-    HTTP client and the local HF backend serializes generation internally.
+    ThreadPoolExecutor: the remote backends are HTTP clients, and the local
+    HF backend serializes generation internally.
     """
-    weights = [c.weight for c in qa.rubric.criteria]
-    if not parallel or n_samples <= 1:
-        return [_score_one(solver, judge, qa, weights, i) for i in range(n_samples)]
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=n_samples) as pool:
-        futures = [pool.submit(_score_one, solver, judge, qa, weights, i)
-                   for i in range(n_samples)]
-        return [f.result() for f in futures]
+    scores = _run_samples(solver, judge, qa, list(range(n_samples)), parallel, retries, prompts)
+    for _ in range(retries):
+        failed = [i for i, s in enumerate(scores)
+                  if s.infra_error and s.judge_feedback.startswith(_SOLVER_ERROR)]
+        if not failed:
+            break
+        rerun = _run_samples(solver, judge, qa, failed, parallel, retries, prompts)
+        for i, s in zip(failed, rerun, strict=True):
+            scores[i] = s
+    return scores
 
 
 # ---------------------------------------------------------------------------
@@ -149,13 +221,15 @@ def _cli() -> int:
     ap.add_argument("--strong-only", action="store_true")
     ap.add_argument("--n-samples", type=int, default=3)
     ap.add_argument("--models-yaml", default="conf/models/default.yaml")
+    ap.add_argument("--config-yaml", default="conf/config.yaml")
     args = ap.parse_args()
 
     if args.weak_only and args.strong_only:
         raise SystemExit("--weak-only and --strong-only are mutually exclusive")
 
-    clients = build_role_clients_from_yaml(args.models_yaml)
+    clients = build_role_clients_from_yaml(args.models_yaml, args.config_yaml)
     judge = clients["judge"]
+    prompts = PromptSet.seed()
 
     qa_records = json.loads(Path(args.eval_input).read_text())
     if isinstance(qa_records, dict):
@@ -165,11 +239,13 @@ def _cli() -> int:
     for rec in qa_records:
         qa = QAPair.model_validate(rec)
         if not args.strong_only:
-            weak_samples = score_solver(clients["weak_solver"], judge, qa, args.n_samples)
+            weak_samples = score_solver(clients["weak_solver"], judge, qa, args.n_samples,
+                                        prompts=prompts)
         else:
             weak_samples = []
         if not args.weak_only:
-            strong_samples = score_solver(clients["strong_solver"], judge, qa, args.n_samples)
+            strong_samples = score_solver(clients["strong_solver"], judge, qa, args.n_samples,
+                                          prompts=prompts)
         else:
             strong_samples = []
         results.append({
@@ -190,4 +266,4 @@ if __name__ == "__main__":
     raise SystemExit(_cli())
 
 
-__all__ = ["score_solver", "weighted_average"]
+__all__ = ["JudgeOutputError", "judge_answer", "rubric_score", "score_solver"]

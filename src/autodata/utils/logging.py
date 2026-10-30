@@ -7,7 +7,12 @@ import sys
 
 
 def setup_logging(level: str = "INFO") -> None:
-    """Configure root logger with rich handler if available."""
+    """Put one console handler (rich if available) on the root logger.
+
+    File handlers stay: Hydra's writes the run log beside ``.hydra/``.
+    httpx (httpx2 under openai>=3) logs every request at INFO; usage.jsonl
+    already records each call.
+    """
     try:
         from rich.logging import RichHandler
         handler: logging.Handler = RichHandler(rich_tracebacks=True, show_time=True)
@@ -15,13 +20,14 @@ def setup_logging(level: str = "INFO") -> None:
     except ImportError:
         handler = logging.StreamHandler(sys.stderr)
         fmt = "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
-    logging.basicConfig(
-        level=level.upper(),
-        format=fmt,
-        datefmt="%H:%M:%S",
-        handlers=[handler],
-        force=True,
-    )
+    handler.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
+    root = logging.getLogger()
+    for h in [h for h in root.handlers if not isinstance(h, logging.FileHandler)]:
+        root.removeHandler(h)
+    root.addHandler(handler)
+    root.setLevel(level.upper())
+    for name in ("httpx", "httpx2"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def get_logger(name: str) -> logging.Logger:

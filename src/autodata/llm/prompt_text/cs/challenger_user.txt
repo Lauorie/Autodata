@@ -1,0 +1,8 @@
+PAPER: $paper_title (id=$paper_id)
+
+FULL PAPER TEXT:
+"""
+$paper_text
+"""
+
+$task

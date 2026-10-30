@@ -1,212 +1,173 @@
-"""Outer evolution loop over the prompts module.
+"""The outer loop: meta-optimize the challenger and verifier prompts.
 
-A `Variant` is a snapshot of `prompts.py` source. Each variant has a fitness
-score = fraction of validation chunks for which the inner loop produced an
-ACCEPTED QA pair (the "validation pass rate" reported in the AutoData blog).
+arXiv 2606.25996, Sec 4. Each iteration:
+  1. Pick a parent from the population by Boltzmann sampling (T = 0.1).
+  2. Run the parent on a minibatch of train papers; keep the trajectories.
+  3. The analyzer reads them and writes a root-cause analysis.
+  4. The implementer reads the analysis, the log and the parent's prompts,
+     and proposes a mutant.
+  5. Re-evaluate parent and mutant on the held-out validation papers. A
+     session counts only if its question also passes the fixed end-of-loop
+     filter (evaluation.py).
+  6. Keep the mutant only if its score strictly beats the parent's mean
+     over all its evaluations.
+  7. Append the outcome to the log the next iteration reads.
 
-The driver:
-  1. Seed population with the original (unmutated) prompts -> evaluate fitness.
-  2. For G generations:
-       a. Boltzmann-sample a parent.
-       b. Ask the meta-optimizer LLM for a mutated prompts source.
-       c. Validate syntactically; load it as a runtime module.
-       d. Evaluate fitness on the same validation set.
-       e. Accept iff fitness > parent's fitness.
-
-We isolate per-variant prompts via Python module hot-swap rather than
-in-place mutation of the installed package — this matches the blog's
-"never mutate in place" guidance.
+An evaluation with too many sessions lost to infrastructure decides
+nothing: the iteration is logged as invalid_eval and no score is kept.
+Iterations run one after another; the paper runs several at once.
 """
 
 from __future__ import annotations
 
-import importlib.util
+import json
 import logging
 import random
-import sys
-import uuid
-from dataclasses import asdict, dataclass, field
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from ..data_module import Chunk
+from ..data_module import Paper
 from ..llm import LLMClient
+from ..llm.errors import LLMError
+from ..llm.prompt_set import PromptSet
 from ..pipeline.acceptance import AcceptanceCriteria
-from ..pipeline.inner_loop import InnerLoopConfig, run_inner_loop_for_chunk
-from .boltzmann import boltzmann_sample
-from .mutator import propose_mutation, summarize_failure_patterns, validate_mutated_source
+from ..pipeline.final_filter import RubricShape
+from ..pipeline.inner_loop import InnerLoopConfig
+from .analyzer import analyze
+from .digest import render_sessions
+from .evaluation import EvalResult, evaluate
+from .history import IterationRecord, append_record, render_log
+from .implementer import ImplementerError, propose
+from .population import Variant, save_population, save_variant, select_parent
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class Variant:
-    variant_id: str
-    parent_id: str | None
-    generation: int
-    prompts_source: str
-    score: float = 0.0
-    n_accepted: int = 0
-    n_chunks: int = 0
-    rejection_reasons: list[list[str]] = field(default_factory=list)
-    judge_feedbacks: list[str] = field(default_factory=list)
+@dataclass(frozen=True)
+class MetaConfig:
+    iterations: int = 4
+    temperature: float = 0.1
+    train_minibatch: int = 5
+    val_samples_per_paper: int = 4
+    session_rounds: int = 1
+    answer_chars: int = 1500
+    min_scored_fraction: float = 0.8
+    max_prompt_chars: int = 20000
+    edit_retries: int = 2
+    workers: int = 4
+
+
+def split_papers(papers: Sequence[Paper], n_train: int, n_val: int,
+                 seed: int) -> tuple[list[Paper], list[Paper]]:
+    """Disjoint train and validation papers, the same for the same seed."""
+    if len(papers) < n_train + n_val:
+        raise ValueError(f"need {n_train + n_val} papers, have {len(papers)}")
+    shuffled = list(papers)
+    random.Random(seed).shuffle(shuffled)
+    return shuffled[n_val:n_val + n_train], shuffled[:n_val]
+
+
+def _save_sessions(path: Path, result: EvalResult) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for s in result.sessions:
+            row = {"paper_id": s.paper_id, "passed": s.passed, "stopped_by": s.stopped_by,
+                   "rounds": [asdict(r) for r in s.rounds],
+                   "final_filter": s.final_verdict.model_dump() if s.final_verdict else None}
+            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
 
 @dataclass(frozen=True)
-class MetaConfig:
-    n_generations: int = 4
-    temperature: float = 0.1
-    validation_chunks: int = 8
+class _Run:
+    """What every iteration shares."""
+
+    seed: PromptSet
+    train: Sequence[Paper]
+    val: Sequence[Paper]
+    clients: dict[str, LLMClient]
+    criteria: AcceptanceCriteria
+    session_cfg: InnerLoopConfig
+    shape: RubricShape
+    cfg: MetaConfig
+    out_dir: Path
+
+    def evaluate(self, prompts: PromptSet, papers: Sequence[Paper], samples: int) -> EvalResult:
+        return evaluate(prompts, papers, self.clients, self.criteria, self.session_cfg,
+                        self.shape, samples, self.cfg.workers)
 
 
-# ---------------------------------------------------------------------------
+def _iterate(it: int, run: _Run, population: list[Variant], history: list[IterationRecord],
+             rng: random.Random) -> IterationRecord:
+    cfg, d = run.cfg, run.out_dir / "iterations" / f"{it:03d}"
+    idx = select_parent(population, cfg.temperature, rng)
+    parent = population[idx]
+    log = render_log(history)
 
-def _load_prompts_module(src: str, name: str) -> Any:
-    """Materialise a Python module object from raw source string."""
-    mod_name = f"autodata._mutated_prompts_{name}"
-    spec = importlib.util.spec_from_loader(mod_name, loader=None)
-    if spec is None:  # pragma: no cover
-        raise RuntimeError("could not create spec")
-    module = importlib.util.module_from_spec(spec)
-    exec(compile(src, f"<{mod_name}>", "exec"), module.__dict__)
-    sys.modules[mod_name] = module
-    return module
-
-
-def _evaluate_variant(
-    variant: Variant,
-    chunks: list[Chunk],
-    clients: dict[str, LLMClient],
-    criteria: AcceptanceCriteria,
-    inner_cfg: InnerLoopConfig,
-) -> Variant:
-    """Run the inner loop on `chunks` using this variant's prompts source.
-
-    Hot-swaps `autodata.llm.prompts` for the duration of the eval so the
-    inner-loop code transparently picks up the mutated prompts.
-    """
-    from autodata.llm import prompts as base_prompts
-
-    mutated = _load_prompts_module(variant.prompts_source, variant.variant_id)
-    saved = {k: getattr(base_prompts, k, None) for k in dir(mutated) if not k.startswith("_")}
-    for k in saved:
-        if hasattr(mutated, k):
-            setattr(base_prompts, k, getattr(mutated, k))
+    batch = rng.sample(list(run.train), min(cfg.train_minibatch, len(run.train)))
+    train = run.evaluate(parent.prompts, batch, 1)
+    _save_sessions(d / "train.jsonl", train)
+    meta = run.clients["meta_optimizer"]
     try:
-        n_acc = 0
-        rejs: list[list[str]] = []
-        fbs: list[str] = []
-        for chunk in chunks:
-            qa, rounds = run_inner_loop_for_chunk(chunk, clients, criteria, inner_cfg)
-            if qa is not None:
-                n_acc += 1
-            for r in rounds:
-                if r.acceptance and not r.accepted:
-                    rejs.append(list(r.acceptance.get("reasons", [])))
-                for s in r.weak_samples + r.strong_samples:
-                    fb = s.get("judge_feedback") if isinstance(s, dict) else None
-                    if fb:
-                        fbs.append(fb)
-    finally:
-        for k, v in saved.items():
-            if v is None:
-                if hasattr(base_prompts, k):
-                    delattr(base_prompts, k)
-            else:
-                setattr(base_prompts, k, v)
+        analysis = analyze(meta, render_sessions(train, cfg.answer_chars), log, run.criteria)
+    except LLMError as e:
+        return IterationRecord(it, parent.variant_id, "analysis_failed", note=str(e))
+    (d / "analysis.md").write_text(analysis + "\n", encoding="utf-8")
+    try:
+        proposal = propose(meta, parent.prompts, analysis, log, run.criteria,
+                           cfg.max_prompt_chars, cfg.edit_retries)
+    except (ImplementerError, LLMError) as e:
+        return IterationRecord(it, parent.variant_id, "no_proposal", note=str(e))
 
-    variant.n_accepted = n_acc
-    variant.n_chunks = len(chunks)
-    variant.score = n_acc / max(len(chunks), 1)
-    variant.rejection_reasons = rejs
-    variant.judge_feedbacks = fbs[:30]
-    logger.info("variant %s gen=%d -> score=%.3f (%d/%d)",
-                variant.variant_id, variant.generation,
-                variant.score, n_acc, len(chunks))
-    return variant
+    child = Variant(f"it{it:03d}", parent.variant_id, it, proposal.prompts)
+    parent_val = run.evaluate(parent.prompts, run.val, cfg.val_samples_per_paper)
+    child_val = run.evaluate(child.prompts, run.val, cfg.val_samples_per_paper)
+    _save_sessions(d / "val_parent.jsonl", parent_val)
+    _save_sessions(d / "val_child.jsonl", child_val)
+    common: dict[str, Any] = {"child_id": child.variant_id, "changed": proposal.changed,
+                              "rationale": proposal.rationale}
+    parent_score, child_score = parent_val.score, child_val.score
+    if (parent_score is None or child_score is None
+            or not parent_val.is_valid(cfg.min_scored_fraction)
+            or not child_val.is_valid(cfg.min_scored_fraction)):
+        save_variant(child, run.out_dir, run.seed)
+        note = (f"scored {parent_val.scored}/{len(parent_val.sessions)} parent and "
+                f"{child_val.scored}/{len(child_val.sessions)} child sessions")
+        return IterationRecord(it, parent.variant_id, "invalid_eval", note=note, **common)
+
+    parent = parent.with_score(parent_score)
+    population[idx] = parent
+    child = child.with_score(child_score)
+    parent_mean = sum(parent.scores) / len(parent.scores)
+    accepted = child_score > parent_mean
+    if accepted:
+        population.append(child)
+    save_variant(parent, run.out_dir, run.seed)
+    save_variant(child, run.out_dir, run.seed)
+    return IterationRecord(it, parent.variant_id, "accepted" if accepted else "rejected",
+                           parent_score=parent_mean, child_score=child_score, **common)
 
 
-def run_meta_optimization(
-    seed_prompts_path: str | Path,
-    val_chunks: list[Chunk],
-    clients: dict[str, LLMClient],
-    criteria: AcceptanceCriteria,
-    inner_cfg: InnerLoopConfig,
-    out_dir: str | Path,
-    cfg: MetaConfig,
-    rng: random.Random | None = None,
-) -> list[Variant]:
-    rng = rng or random.Random(0)
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    seed_src = Path(seed_prompts_path).read_text()
-    seed = Variant(variant_id="gen0_seed", parent_id=None,
-                   generation=0, prompts_source=seed_src)
-    _evaluate_variant(seed, val_chunks, clients, criteria, inner_cfg)
-    population: list[Variant] = [seed]
-    _persist_variant(seed, out_dir)
-
-    for g in range(1, cfg.n_generations + 1):
-        scores = [v.score for v in population]
-        parent_idx = boltzmann_sample(scores, cfg.temperature, rng)
-        parent = population[parent_idx]
-        logger.info("[gen %d] parent=%s score=%.3f", g, parent.variant_id, parent.score)
-
-        try:
-            new_src = propose_mutation(
-                clients["meta_optimizer"],
-                parent.prompts_source,
-                summarize_failure_patterns(parent.rejection_reasons, parent.judge_feedbacks),
-            )
-            ok, msg = validate_mutated_source(new_src)
-            if not ok:
-                logger.warning("[gen %d] mutation invalid: %s", g, msg)
-                continue
-        except Exception as e:
-            logger.exception("[gen %d] mutation proposal failed: %s", g, e)
-            continue
-
-        child = Variant(
-            variant_id=f"gen{g}_{uuid.uuid4().hex[:6]}",
-            parent_id=parent.variant_id,
-            generation=g,
-            prompts_source=new_src,
-        )
-        _evaluate_variant(child, val_chunks, clients, criteria, inner_cfg)
-        if child.score > parent.score:
-            population.append(child)
-            logger.info("[gen %d] ACCEPT child %s (%.3f > %.3f)",
-                        g, child.variant_id, child.score, parent.score)
-        else:
-            logger.info("[gen %d] REJECT child %s (%.3f ≤ %.3f)",
-                        g, child.variant_id, child.score, parent.score)
-        _persist_variant(child, out_dir)
-
-    _persist_population(population, out_dir)
+def run_meta_optimization(seed: PromptSet, train_papers: Sequence[Paper],
+                          val_papers: Sequence[Paper], clients: dict[str, LLMClient],
+                          criteria: AcceptanceCriteria, inner_cfg: InnerLoopConfig,
+                          shape: RubricShape, cfg: MetaConfig, out_dir: str | Path,
+                          rng: random.Random) -> list[Variant]:
+    """Run ``cfg.iterations`` iterations; return the final population."""
+    out = Path(out_dir)
+    run = _Run(seed, train_papers, val_papers, clients, criteria,
+               replace(inner_cfg, max_iterations=cfg.session_rounds), shape, cfg, out)
+    population = [Variant("seed", None, 0, seed)]
+    save_variant(population[0], out, seed)
+    history: list[IterationRecord] = []
+    for it in range(1, cfg.iterations + 1):
+        record = _iterate(it, run, population, history, rng)
+        history.append(record)
+        append_record(out / "history.jsonl", record)
+        save_population(population, out)
+        logger.info("[meta %d/%d] %s", it, cfg.iterations, render_log([record]))
     return population
 
 
-def _persist_variant(v: Variant, out_dir: Path) -> None:
-    d = out_dir / v.variant_id
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "prompts.py").write_text(v.prompts_source)
-    meta = {k: val for k, val in asdict(v).items() if k != "prompts_source"}
-    import json
-    (d / "meta.json").write_text(json.dumps(meta, indent=2, default=str))
-
-
-def _persist_population(population: list[Variant], out_dir: Path) -> None:
-    import json
-    rows = [{
-        "variant_id": v.variant_id,
-        "parent_id": v.parent_id,
-        "generation": v.generation,
-        "score": v.score,
-        "n_accepted": v.n_accepted,
-        "n_chunks": v.n_chunks,
-    } for v in population]
-    (out_dir / "population.json").write_text(json.dumps(rows, indent=2))
-
-
-__all__ = ["MetaConfig", "Variant", "run_meta_optimization"]
+__all__ = ["MetaConfig", "run_meta_optimization", "split_papers"]

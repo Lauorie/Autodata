@@ -1,19 +1,27 @@
-"""Agentic Self-Instruct inner loop.
+"""Agentic Self-Instruct inner loop (arXiv 2606.25996, Sec 3.1 and Fig 7).
 
-Reproduces the 8-step protocol from the AutoData blog:
+Repeat until ACCEPTED or the step budget runs out:
 
-  Repeat until ACCEPTED or steps exhausted:
-    1. Call Challenger to generate QA + rubric
-    2. Call Quality Verifier
-    3. If QV fails -> iterate with feedback
-    4. Run weak-only solver evaluation
-    5. If weak fails -> iterate with feedback
-    6. Run strong-only solver evaluation
-    7. Check strong criteria + gap; if fails -> iterate
-    8. ACCEPTED if all criteria pass
+  1. Challenger writes context + question + reference answer + rubric
+  2. Quality Verifier checks it; on failure -> back to 1
+  3. Weak solver (N samples), graded by the judge; if the weak check fails
+     -> back to 1 and the strong solver never runs
+  4. Strong solver (N samples), graded; strong range + gap check
+  5. ACCEPTED if every check passes
 
-We do (4) before (6) to short-circuit on weak-pass / weak-too-strong before
-spending strong-solver tokens.
+Each refinement round shows the challenger every earlier failed question of
+the paper, grouped by failure mode, and asks for an entirely new question
+from a different angle.
+
+Errors (Fig 7): an infrastructure failure re-runs the evaluation of the same
+question, up to ``infra_retries`` times, then stops the paper; it never
+enters the history, since it says nothing about the question. A paper too
+long for the model stops at once. A solver answer cut at the token budget
+is the solver's failure and is scored.
+
+The unit of work is one paper. The challenger and quality verifier read the
+whole paper; the solvers see only the challenger-written context and the
+question.
 """
 
 from __future__ import annotations
@@ -24,31 +32,43 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..data_module import Chunk
-from ..llm import LLMClient, QAPair, RubricSpec, SolverScore, VerifierVerdict
-from ..llm import prompts as _prompts_module      # late-bound on every call
+from pydantic import ValidationError
+
+from ..data_module import Paper
+from ..llm import LLMClient, QAPair, RubricSpec, SolverScore
 from ..llm.client import extract_json
-from .acceptance import AcceptanceCriteria, AcceptanceResult, check_acceptance
+from ..llm.errors import ContextLengthError, OutputTruncatedError
+from ..llm.prompt_set import PromptSet
+from .acceptance import AcceptanceCriteria, check_strong, check_weak
 from .evaluate_rubric import score_solver
+from .feedback import FailedAttempt, render_history, snippet
+from .quality_verifier import VerifierOutputError, verify_quality
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class InnerLoopConfig:
-    max_iterations: int = 6
+    max_iterations: int = 15
     num_solver_samples: int = 3
-    qa_per_chunk: int = 1     # how many distinct accepted QAs we want per chunk
+    infra_retries: int = 2
+    """Re-runs of a failed solver sample, and re-asks of an unusable judge or
+    verifier reply, before the paper stops."""
     parallel_solvers: bool = True
-    """When True, run weak + strong solvers (and their N samples) concurrently
-    via thread pools. Set False in tests with order-sensitive fake backends."""
+    """When True, a solver's N samples run concurrently. Set False in tests
+    with order-sensitive fake backends."""
 
 
 @dataclass
 class RoundRecord:
-    """One pass through the loop (one Challenger emission)."""
+    """One pass through the loop (one Challenger emission).
+
+    ``outcome`` is "accepted", "malformed", "infra_error", "paper_too_long",
+    "error", or one of the failure modes in ``feedback.FAILURE_MODES``.
+    """
 
     iteration: int
+    outcome: str = ""
     qa: dict[str, Any] | None = None
     qv_verdict: dict[str, Any] | None = None
     weak_samples: list[dict[str, Any]] = field(default_factory=list)
@@ -63,190 +83,210 @@ class RoundRecord:
 # Per-step helpers
 # ---------------------------------------------------------------------------
 
-def _challenger_step(challenger: LLMClient, chunk: Chunk, feedback: str) -> QAPair:
-    raw = challenger.chat([
-        {"role": "system", "content": _prompts_module.CHALLENGER_SYSTEM},
-        {"role": "user", "content": _prompts_module.challenger_user(
-            chunk.title, chunk.paper_id, chunk.text, feedback)},
-    ])
-    obj = extract_json(raw)
-    qa = QAPair(
-        question=str(obj["question"]),
-        context=chunk.text,
-        reference_answer=str(obj["reference_answer"]),
-        rubric=RubricSpec.model_validate(obj["rubric"]),
-        paper_id=chunk.paper_id,
-        chunk_id=chunk.chunk_id,
-        metadata={"section": chunk.section},
-    )
-    return qa
+class MalformedOutputError(ValueError):
+    """Challenger output was not JSON, or broke the QAPair contract."""
 
 
-def _qv_step(qv: LLMClient, chunk: Chunk, qa: QAPair) -> VerifierVerdict:
-    rubric_json = json.dumps(qa.rubric.model_dump(), ensure_ascii=False)
-    raw = qv.chat([
-        {"role": "system", "content": _prompts_module.QUALITY_VERIFIER_SYSTEM},
-        {"role": "user", "content": _prompts_module.quality_verifier_user(
-            chunk.title, chunk.text, qa.question, qa.reference_answer, rubric_json)},
-    ])
-    obj = extract_json(raw)
-    raw_passed = obj.get("passed", False)
-    # Strict bool. Anything that isn't unambiguously truthy is treated as False
-    # (fail-closed). Reasoning: a malformed verifier response should never let a
-    # bad QA pair through the gate.
-    if isinstance(raw_passed, bool):
-        passed = raw_passed
-    elif isinstance(raw_passed, str):
-        passed = raw_passed.strip().lower() in {"true", "yes"}
-    elif raw_passed in (0, 1):
-        passed = bool(raw_passed)
-    else:
-        passed = False
-    return VerifierVerdict(
-        passed=passed,
-        feedback=str(obj.get("feedback", "")),
-        issues=[str(x) for x in obj.get("issues", [])],
+class PaperTooLongError(RuntimeError):
+    """The paper does not fit the challenger's or the verifier's context."""
+
+
+# Outcomes that stop the paper: retrying them, or asking for a new question,
+# would fail the same way. None of them says anything about the question.
+STOP_OUTCOMES = frozenset({"infra_error", "paper_too_long", "error"})
+
+
+def stop_reason(rounds: list[RoundRecord]) -> str | None:
+    """The outcome that stopped the paper early, or None."""
+    last = rounds[-1].outcome if rounds else None
+    return last if last in STOP_OUTCOMES else None
+
+
+def _describe_validation_error(e: ValidationError) -> str:
+    return "; ".join(
+        f"{'.'.join(str(x) for x in err['loc'])}: {err['msg']}" for err in e.errors()
     )
 
 
-def _weak_too_strong(weak_scores: list[float], crit: AcceptanceCriteria) -> bool:
-    """Short-circuit hint: if weak already saturated, no point asking strong solver."""
-    if not weak_scores:
-        return False
-    weak_avg = sum(weak_scores) / len(weak_scores)
-    return weak_avg > crit.weak_avg_max + 0.10  # generous slop before short-circuit
+def _challenger_step(challenger: LLMClient, paper: Paper, feedback: str,
+                     prompts: PromptSet) -> QAPair:
+    try:
+        raw = challenger.chat([
+            {"role": "system", "content": prompts.challenger_system},
+            {"role": "user", "content": prompts.render_challenger(
+                paper.title, paper.paper_id, paper.text, feedback)},
+        ])
+    except ContextLengthError as e:
+        raise PaperTooLongError(f"challenger: {e}") from e
+    except OutputTruncatedError as e:
+        raise MalformedOutputError(
+            f"your reply hit the output limit (max_tokens={e.max_tokens}) before the JSON "
+            "was complete; keep the reasoning focused and the JSON compact") from e
+    try:
+        obj = extract_json(raw)
+    except json.JSONDecodeError as e:
+        raise MalformedOutputError(f"invalid JSON: {e}") from e
+    if not isinstance(obj, dict):
+        raise MalformedOutputError(f"expected a JSON object, got {type(obj).__name__}")
+    try:
+        return QAPair(
+            question_type=obj["question_type"],
+            skill_tags=obj.get("skill_tags", []),
+            context=obj["context"],
+            question=obj["question"],
+            reference_answer=obj["reference_answer"],
+            rubric=RubricSpec(criteria=obj["rubric"]),
+            paper_id=paper.paper_id,
+        )
+    except KeyError as e:
+        raise MalformedOutputError(f"missing key {e}") from e
+    except ValidationError as e:
+        raise MalformedOutputError(_describe_validation_error(e)) from e
+
+
+def _first_infra_error(samples: list[SolverScore]) -> str | None:
+    return next((s.judge_feedback for s in samples if s.infra_error), None)
+
+
+def _truncation_note(samples: list[SolverScore], solver: str) -> str:
+    n = sum(s.truncated for s in samples)
+    return f"; {n}/{len(samples)} {solver} attempts hit the token budget" if n else ""
+
+
+def _evaluate(qa: QAPair, paper: Paper, clients: dict[str, LLMClient],
+              criteria: AcceptanceCriteria, cfg: InnerLoopConfig,
+              rec: RoundRecord, prompts: PromptSet) -> FailedAttempt | None:
+    """Fig 7 steps 2-8 for one question. Fills ``rec``; returns the history
+    entry when the question failed on its merits, else None."""
+    try:
+        verdict = verify_quality(clients["quality_verifier"], paper, qa, cfg.infra_retries,
+                                 prompts=prompts)
+    except ContextLengthError as e:
+        raise PaperTooLongError(f"quality verifier: {e}") from e
+    rec.qv_verdict = verdict.model_dump()
+    if not verdict.passed:
+        rec.outcome = "failed_qv"
+        rec.acceptance = {"accepted": False, "reasons": ["quality_verifier_failed"]}
+        return FailedAttempt("failed_qv", qa.question,
+                             f"issues: {', '.join(verdict.issues)}; "
+                             f"verifier: {snippet(verdict.feedback)}")
+
+    weak = score_solver(clients["weak_solver"], clients["judge"], qa,
+                        cfg.num_solver_samples, cfg.parallel_solvers, cfg.infra_retries,
+                        prompts=prompts)
+    rec.weak_samples = [s.model_dump() for s in weak]
+    if (err := _first_infra_error(weak)) is not None:
+        rec.outcome, rec.error = "infra_error", f"weak solver: {err}"
+        return None
+    wc = check_weak([s.weighted_score for s in weak], criteria)
+    rec.acceptance = {"accepted": False, "reasons": wc.reasons,
+                      "weak_avg": wc.weak_avg, "weak_max": wc.weak_max,
+                      "strong_avg": None, "gap": None}
+    if not wc.passed:
+        rec.outcome = "too_easy" if wc.too_easy else "weak_zero"
+        best = max(weak, key=lambda s: s.weighted_score)
+        return FailedAttempt(rec.outcome, qa.question,
+                             f"weak_avg={wc.weak_avg:.2f} weak_max={wc.weak_max:.2f}"
+                             f"{_truncation_note(weak, 'weak')}; "
+                             f"judge: {snippet(best.judge_feedback)}")
+
+    strong = score_solver(clients["strong_solver"], clients["judge"], qa,
+                          cfg.num_solver_samples, cfg.parallel_solvers, cfg.infra_retries,
+                          prompts=prompts)
+    rec.strong_samples = [s.model_dump() for s in strong]
+    if (err := _first_infra_error(strong)) is not None:
+        rec.outcome, rec.error = "infra_error", f"strong solver: {err}"
+        return None
+    sc = check_strong(wc.weak_avg, [s.weighted_score for s in strong], criteria)
+    rec.acceptance.update(accepted=sc.passed, reasons=sc.reasons,
+                          strong_avg=sc.strong_avg, gap=sc.gap)
+    if sc.passed:
+        rec.outcome, rec.accepted = "accepted", True
+        return None
+    rec.outcome = "failed_on_strong"
+    worst = min(strong, key=lambda s: s.weighted_score)
+    return FailedAttempt("failed_on_strong", qa.question,
+                         f"strong_avg={sc.strong_avg:.2f} weak_avg={wc.weak_avg:.2f} "
+                         f"gap={sc.gap:.2f} ({'; '.join(sc.reasons)})"
+                         f"{_truncation_note(strong, 'strong')}; "
+                         f"judge: {snippet(worst.judge_feedback)}")
+
+
+def _compose_feedback(history: list[FailedAttempt], malformed_note: str) -> str:
+    return "\n\n".join(p for p in (malformed_note, render_history(history)) if p)
 
 
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
-def run_inner_loop_for_chunk(
-    chunk: Chunk,
+def run_inner_loop_for_paper(
+    paper: Paper,
     clients: dict[str, LLMClient],
     criteria: AcceptanceCriteria,
     cfg: InnerLoopConfig,
+    prompts: PromptSet | None = None,
 ) -> tuple[QAPair | None, list[RoundRecord]]:
-    """Run the Agentic Self-Instruct loop on one chunk.
+    """Run the Agentic Self-Instruct loop on one paper.
 
-    Returns (accepted_QA_or_None, list_of_round_records).
+    ``prompts`` defaults to the seed set. Returns (accepted_QA_or_None,
+    list_of_round_records).
     """
-    challenger = clients["challenger"]
-    qv = clients["quality_verifier"]
-    weak = clients["weak_solver"]
-    strong = clients["strong_solver"]
-    judge = clients["judge"]
-
-    feedback_for_next = ""
+    prompts = prompts or PromptSet.seed()
+    history: list[FailedAttempt] = []
+    malformed_note = ""
     rounds: list[RoundRecord] = []
-    accepted_qa: QAPair | None = None
 
     for it in range(cfg.max_iterations):
         rec = RoundRecord(iteration=it)
         t0 = time.time()
+        feedback = _compose_feedback(history, malformed_note)
+        malformed_note = ""
         try:
-            # 1. Challenger
-            qa = _challenger_step(challenger, chunk, feedback_for_next)
+            qa = _challenger_step(clients["challenger"], paper, feedback, prompts)
             rec.qa = qa.model_dump()
-
-            # 2-3. Quality Verifier
-            verdict = _qv_step(qv, chunk, qa)
-            rec.qv_verdict = verdict.model_dump()
-            if not verdict.passed:
-                feedback_for_next = (
-                    f"[Quality Verifier rejected] issues={verdict.issues}\n{verdict.feedback}"
-                )
-                rec.acceptance = {"reasons": ["quality_verifier_failed"], "accepted": False}
-                rec.duration_s = time.time() - t0
-                rounds.append(rec)
-                logger.info("[%s it=%d] QV rejected: %s", chunk.chunk_id, it, verdict.issues)
-                continue
-
-            # 4-6. Weak + Strong solvers (parallel for prod; serial for tests).
-            if cfg.parallel_solvers:
-                from concurrent.futures import ThreadPoolExecutor
-                with ThreadPoolExecutor(max_workers=2) as pool:
-                    fut_weak = pool.submit(score_solver, weak, judge, qa,
-                                           cfg.num_solver_samples, True)
-                    fut_strong = pool.submit(score_solver, strong, judge, qa,
-                                             cfg.num_solver_samples, True)
-                    weak_samples = fut_weak.result()
-                    strong_samples = fut_strong.result()
-            else:
-                weak_samples = score_solver(weak, judge, qa,
-                                            cfg.num_solver_samples, parallel=False)
-                strong_samples = score_solver(strong, judge, qa,
-                                              cfg.num_solver_samples, parallel=False)
-            rec.weak_samples = [s.model_dump() for s in weak_samples]
-            rec.strong_samples = [s.model_dump() for s in strong_samples]
-            weak_scores = [s.weighted_score for s in weak_samples]
-            strong_scores = [s.weighted_score for s in strong_samples]
-
-            # 7. Acceptance check
-            ar = check_acceptance(weak_scores, strong_scores, verdict.passed, criteria)
-            rec.acceptance = {
-                "accepted": ar.accepted,
-                "reasons": ar.reasons,
-                "weak_avg": ar.weak_avg, "weak_max": ar.weak_max,
-                "strong_avg": ar.strong_avg, "gap": ar.gap,
-            }
-
-            if ar.accepted:
-                rec.accepted = True
-                accepted_qa = qa
-                rec.duration_s = time.time() - t0
-                rounds.append(rec)
-                logger.info("[%s it=%d] ACCEPTED (gap=%.2f weak=%.2f strong=%.2f)",
-                            chunk.chunk_id, it, ar.gap, ar.weak_avg, ar.strong_avg)
-                break
-
-            feedback_for_next = _build_iteration_feedback(ar, weak_samples, strong_samples)
-            rec.duration_s = time.time() - t0
-            rounds.append(rec)
-            logger.info("[%s it=%d] rejected: %s", chunk.chunk_id, it, ar.reasons)
-
-        except json.JSONDecodeError as e:
-            # Challenger / Verifier / Judge produced unparseable JSON. This is
-            # usually transient (high-temperature challenger, occasional
-            # malformed string). Burn one iteration and retry rather than
-            # aborting the whole chunk.
-            logger.warning("[%s it=%d] JSON parse error (will retry next iter): %s",
-                           chunk.chunk_id, it, e)
-            rec.error = f"JSONDecodeError: {e}"
-            rec.duration_s = time.time() - t0
-            rounds.append(rec)
-            feedback_for_next = (
-                "[Your previous response could not be parsed as JSON] "
+            failure = _evaluate(qa, paper, clients, criteria, cfg, rec, prompts)
+        except MalformedOutputError as e:
+            # The challenger broke the output contract (bad JSON, weight 0,
+            # sign/category mismatch). Burn one round and say what was wrong.
+            rec.outcome, rec.error = "malformed", f"{type(e).__name__}: {e}"
+            malformed_note = (
+                f"[Your previous response was malformed] {e}\n"
                 "Reply ONLY with a single valid JSON object as specified, "
                 "no prose, no markdown fences, no unterminated strings."
             )
-            continue
+        except VerifierOutputError as e:
+            # No usable verdict after re-asks: nothing learned about the
+            # question, so it stays out of the history.
+            rec.outcome, rec.error = "infra_error", f"quality verifier: {e}"
+        except PaperTooLongError as e:
+            rec.outcome, rec.error = "paper_too_long", str(e)
         except Exception as e:
-            # Other exceptions (network, schema validation, ...) are likely
-            # systematic; abort the chunk so we don't loop forever.
-            logger.exception("[%s it=%d] error in round: %s", chunk.chunk_id, it, e)
-            rec.error = f"{type(e).__name__}: {e}"
-            rec.duration_s = time.time() - t0
-            rounds.append(rec)
+            # Network down after client retries, auth, other systematic
+            # failures: stop the paper rather than loop on them.
+            logger.exception("[%s it=%d] error in round: %s", paper.paper_id, it, e)
+            rec.outcome, rec.error = "error", f"{type(e).__name__}: {e}"
+        else:
+            if failure is not None:
+                history.append(failure)
+
+        rec.duration_s = time.time() - t0
+        rounds.append(rec)
+        reasons = (rec.acceptance or {}).get("reasons") or rec.error or ""
+        logger.info("[%s it=%d] %s %s", paper.paper_id, it, rec.outcome, reasons)
+        if rec.accepted:
+            return qa, rounds
+        if rec.outcome in STOP_OUTCOMES:
             break
 
-    return accepted_qa, rounds
+    return None, rounds
 
 
-def _build_iteration_feedback(ar: AcceptanceResult,
-                              weak: list[SolverScore],
-                              strong: list[SolverScore]) -> str:
-    weak_fb = "; ".join(s.judge_feedback[:160] for s in weak[:2])
-    strong_fb = "; ".join(s.judge_feedback[:160] for s in strong[:2])
-    return (
-        "[Acceptance check failed] reasons: " + "; ".join(ar.reasons) + "\n"
-        f"weak_avg={ar.weak_avg:.2f} weak_max={ar.weak_max:.2f} "
-        f"strong_avg={ar.strong_avg:.2f} gap={ar.gap:.2f}\n"
-        f"Sample weak judge feedback: {weak_fb}\n"
-        f"Sample strong judge feedback: {strong_fb}\n"
-        "Adjust the QA so the weak solver is more likely to fail (require more "
-        "paper-specific reasoning) and the strong solver still succeeds."
-    )
-
-
-__all__ = ["InnerLoopConfig", "RoundRecord", "run_inner_loop_for_chunk"]
+__all__ = [
+    "STOP_OUTCOMES",
+    "InnerLoopConfig",
+    "MalformedOutputError",
+    "RoundRecord",
+    "run_inner_loop_for_paper",
+    "stop_reason",
+]

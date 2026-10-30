@@ -1,13 +1,19 @@
-"""Meta-optimization (outer evolution loop)."""
+"""Meta-optimization of the challenger and verifier prompts (outer loop)."""
 
 from .boltzmann import boltzmann_sample
-from .mutator import propose_mutation
-from .outer_loop import MetaConfig, Variant, run_meta_optimization
+from .evaluation import EvalResult, Session, evaluate
+from .history import IterationRecord
+from .outer_loop import MetaConfig, run_meta_optimization, split_papers
+from .population import Variant
 
 __all__ = [
+    "EvalResult",
+    "IterationRecord",
     "MetaConfig",
+    "Session",
     "Variant",
     "boltzmann_sample",
-    "propose_mutation",
+    "evaluate",
     "run_meta_optimization",
+    "split_papers",
 ]

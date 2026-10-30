@@ -1,0 +1,22 @@
+# accelerate config for scripts/train_grpo.py: ZeRO-3 over two GPUs.
+# Full fine-tuning holds fp32 weights, gradients and Adam state (about
+# 72 GB for Qwen3.5-4B) plus an fp32 reference model; sharded, each GPU
+# keeps about half and still has room for its colocated vLLM.
+# Pick the GPUs with CUDA_VISIBLE_DEVICES; num_processes must match.
+compute_environment: LOCAL_MACHINE
+distributed_type: DEEPSPEED
+deepspeed_config:
+  zero_stage: 3
+  zero3_init_flag: true
+  zero3_save_16bit_model: true
+  offload_optimizer_device: none
+  offload_param_device: none
+  deepspeed_multinode_launcher: standard
+mixed_precision: bf16
+num_machines: 1
+num_processes: 2
+machine_rank: 0
+main_training_function: main
+rdzv_backend: static
+same_network: true
+use_cpu: false

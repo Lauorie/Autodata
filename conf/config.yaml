@@ -5,45 +5,117 @@ defaults:
 
 run_id: ???
 seed: 42
+# Prompt directory for the challenger, verifier, solvers and judge. null is
+# the seed CS set (src/autodata/llm/prompt_text/cs); a meta-optimization
+# variant directory works too.
+prompts_dir: null
 
+# Every data path hangs off data_root. Set AUTODATA_DATA_ROOT on a new
+# machine, or override one path on the command line. The fallback is the
+# run box's layout.
 paths:
-  papers_dir: /root/autodl-fs/autodata/papers-mds
-  outputs_root: /root/autodl-fs/autodata/outputs
-  qwen_model_dir: /root/autodl-fs/autodata/Qwen3.5-4B
+  data_root: ${oc.env:AUTODATA_DATA_ROOT,/root/autodl-fs/autodata}
+  papers_dir: ${paths.data_root}/papers-sciarena
+  outputs_root: ${paths.data_root}/outputs
+  qwen_model_dir: ${paths.data_root}/models/Qwen3.5-4B
 
 inner_loop:
-  max_iterations: 6
-  qa_per_chunk: 1
+  # The paper gives no budget: accepted items took 6.59 rounds on average,
+  # with a tail past 10 (Sec 3.1.1). 15 covers that tail.
+  max_iterations: 15
   num_solver_samples: 3
-  max_chunk_chars: 12000
-  chunks_per_paper: null   # null = no cap
+  # Fig 7: an infrastructure failure re-runs the eval of the same question.
+  # After this many re-runs (or judge/verifier re-asks) the paper stops.
+  infra_retries: 2
+
+# One generation setting for both solvers, applied in code to weak and strong.
+# Evaluation reads all of it: the weak solver's budget decides which questions
+# the loop accepts. GRPO rollouts share thinking, max_tokens and temperature
+# but sample the raw policy; top_p, top_k and presence_penalty are decode-time
+# choices that would break the importance ratio (training/grpo.py).
+solver_generation:
+  thinking: true            # Qwen3.5 thinks by default; the paper treats the 4B as a reasoning model
+  max_tokens: 65536         # thinking + answer; paper App A reasoning budget for Qwen3.5-4B
+  temperature: 1.0          # paper Sec 4: solvers run at temperature 1.0
+  top_p: 0.95               # Qwen3.5 model card, thinking mode, general tasks
+  top_k: 20
+  presence_penalty: 1.5
+
+# End-of-loop filter: Fig 9 check-3 rubric counts, then one more QV call.
+final_filter:
+  min_positive: 4
+  min_negative: 3
+  min_total: 10
+  max_total: 20
 
 run:
   papers_limit: null
-  concurrency: 4
-  chunk_concurrency: 4     # how many chunks to process in parallel
+  paper_concurrency: 4     # how many papers to process in parallel
 
+# Training and test data (Sec 3.1): final questions of finished runs,
+# split by paper. scripts/build_dataset.py.
+data:
+  runs: []                  # run directories whose final_qa.jsonl to read
+  test_size: 100            # held out per data source, as in the paper
+
+# Held-out evaluation (Sec 3.1.2): k samples per test question with the
+# weak solver's settings, graded by the judge. scripts/eval_solver.py.
+eval:
+  test_set: null            # test.jsonl from scripts/build_dataset.py
+  samples: 3                # mean@3 and best@3, as in Table 2
+  workers: 8                # questions in parallel
+  label: base               # names the output directory
+
+# Meta-optimization of the challenger and verifier prompts (Sec 4).
 meta:
-  n_generations: 4
-  temperature: 0.1
-  validation_chunks: 8
+  iterations: 4             # the paper ran 233; each costs 1 train + 2 validation evaluations
+  temperature: 0.1          # Boltzmann parent selection
+  train_papers: 50
+  val_papers: 25
+  train_minibatch: 5        # papers per analysis; the paper gives no number
+  val_samples_per_paper: 4  # 25 papers -> the paper's 100 validation samples
+  # Rounds per session. The paper scores "the fraction of generated QA pairs"
+  # that pass, so 1 scores each pair on its own. More rounds score whole
+  # inner-loop runs, which near 1.0 at the 15-round budget (gate: 5/5) and
+  # stop telling variants apart. At 1, challenger_refine is never exercised.
+  session_rounds: 1
+  answer_chars: 1500        # each solver answer shown to the analyzer is cut here
+  min_scored_fraction: 0.8  # fewer scored sessions (infra stops) void the evaluation
+  max_prompt_chars: 20000   # cap on the four mutable prompts together
+  edit_retries: 2           # re-asks of the implementer after an unusable reply
+  workers: 4                # sessions in parallel within one evaluation
 
+# GRPO on the solver (Sec 3.1.2). Rollouts take thinking, budget and
+# temperature from solver_generation and sample the raw policy.
+# scripts/train_grpo.py, launched with conf/accelerate/zero3.yaml.
 train:
-  # Defaults sized for 2× A800-80GB. Halve only if OOM.
-  per_device_batch: 8
-  num_generations: 4
-  max_prompt_length: 4096
-  max_completion_length: 384
-  max_length: 4096       # SFT only
-  max_steps: 30          # demo size; bump for a full run
-  learning_rate: 1e-6
-  grad_accum: 1
-  save_steps: 30
-  logging_steps: 2
-  beta: 0.04
-  lora_r: 16
-  lora_alpha: 32
-  lora_dropout: 0.05
+  data: null                # train.jsonl from scripts/build_dataset.py
+  prompts_per_step: 16      # the paper's batch size 16, read as prompts per step
+  num_generations: 8        # completions per prompt; the paper gives no number
+  per_device_batch: 2       # completions per forward pass; sets gradient accumulation
+  max_steps: 200            # Table 2 reports step 200
+  learning_rate: 1e-6       # the paper's value, for full fine-tuning
+  lr_scheduler: constant    # the paper gives one rate; a linear decay would reach 0 at step 200
+  # null trains every weight, as the paper's learning rate suggests. A LoRA
+  # rank (e.g. 16) fits one GPU but learns little at 1e-6: raise the rate.
+  lora_r: null
+  loss_type: grpo           # the paper cites GRPO (Shao et al.); TRL defaults to dapo
+  beta: 0.04                # KL coefficient of Shao et al.; TRL defaults to 0
+  use_vllm: true            # 65k-token rollouts need vLLM
+  vllm_gpu_memory_utilization: 0.35   # share of each training GPU for its colocated vLLM
+  vllm_sleep: true          # free that share for the backward pass
+  # Correction for vLLM vs trainer logprobs. TRL's default, sequence_mask,
+  # multiplies a few thousand per-token ratios and masks most long completions.
+  vllm_is_mode: token_truncate
+  max_prompt_tokens: 8192   # room for the solver system prompt, context and question
+  # Judge calls in parallel per process. 64 grades a process's share of a
+  # step (16 x 8 / 2) in one wave; at 16 the GPUs sat idle 24% of a step.
+  judge_workers: 64
+  save_steps: 50
+  # A full checkpoint (fp32 weights and Adam state) is about 54 GB; the
+  # shared disk on the run box cannot hold several. Save weights only.
+  save_only_model: true
+  logging_steps: 5
 
 hydra:
   run:

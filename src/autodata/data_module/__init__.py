@@ -1,6 +1,5 @@
-"""Data module: paper loading + section-aware chunking."""
+"""Data module: paper loading."""
 
-from .chunker import Chunk, chunk_paper
 from .paper_loader import Paper, iter_papers, load_paper
 
-__all__ = ["Chunk", "Paper", "chunk_paper", "iter_papers", "load_paper"]
+__all__ = ["Paper", "iter_papers", "load_paper"]

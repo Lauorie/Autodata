@@ -24,10 +24,14 @@ serve = [
     "vllm",
 ]
 train = [
-    "trl>=0.10",
+    "trl>=1.16",      # None rewards: unscorable completions get no advantage
     "peft>=0.11",
-    "bitsandbytes>=0.43",
     "datasets>=2.20",
+]
+corpus = [
+    "httpx",
+    "beautifulsoup4>=4.12",
+    "markdownify>=0.13",
 ]
 dev = [
     "pytest>=8",

@@ -1,0 +1,49 @@
+# Fast, cheap profile for pipeline runs: select with `models=flash`.
+# Same roles and rules as default.yaml; only the gateway models change.
+#
+# DeepSeek-V4.1-Flash through the gateway (probed 2026-10-28): it thinks
+# even when asked not to, so every DeepSeek role is marked thinking and
+# given room for the thought. It accepts temperature 0.0, 0.7 and 1.0.
+# Qwen3.8-Flash takes the full solver_generation block (65,536 tokens,
+# top_k, presence_penalty) and thinks.
+
+challenger:
+  endpoint: proxy
+  model: deepseek/deepseek-v4.1-flash
+  temperature: 0.7
+  max_tokens: 32768
+  thinking: true
+  reasoning_effort: auto
+
+quality_verifier:
+  endpoint: proxy
+  model: deepseek/deepseek-v4.1-flash
+  temperature: 0.0
+  max_tokens: 16384         # thought + verdict JSON
+  thinking: true            # cannot be switched off
+
+judge:
+  endpoint: proxy
+  model: deepseek/deepseek-v4.1-flash
+  temperature: 0.0
+  max_tokens: 16384         # thought + one score per rubric item
+  thinking: true
+
+strong_solver:
+  endpoint: proxy
+  model: qwen/qwen3.8-flash
+  reasoning_effort: auto    # thinking on, model default effort
+
+weak_solver:
+  endpoint: vllm
+  model: qwen3.5-4b         # --served-model-name in scripts/serve_weak_solver.sh
+  base_url_env: WEAK_SOLVER_BASE_URL
+  api_key_env: WEAK_SOLVER_API_KEY
+
+meta_optimizer:
+  endpoint: proxy
+  model: deepseek/deepseek-v4.1-flash
+  temperature: 0.7
+  max_tokens: 16384
+  thinking: true
+  reasoning_effort: auto

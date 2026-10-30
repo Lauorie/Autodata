@@ -35,18 +35,27 @@ def load_paper(path: str | Path) -> Paper:
 
 
 def iter_papers(papers_dir: str | Path, limit: int | None = None) -> Iterator[Paper]:
+    """Papers in filename order. A blank file gives the challenger nothing to
+    read and is skipped; ``limit`` counts the papers returned."""
     d = Path(papers_dir)
     if not d.is_dir():
         raise FileNotFoundError(f"papers dir not found: {d}")
     files = sorted(p for p in d.glob("*.md") if p.is_file())
-    if limit is not None:
-        files = files[:limit]
-    logger.info("loading %d papers from %s", len(files), d)
+    logger.info("loading up to %s of %d papers from %s", limit, len(files), d)
+    n = 0
     for f in files:
+        if limit is not None and n >= limit:
+            return
         try:
-            yield load_paper(f)
-        except Exception as e:
+            paper = load_paper(f)
+        except (OSError, UnicodeDecodeError) as e:
             logger.warning("skip %s: %s", f.name, e)
+            continue
+        if not paper.text.strip():
+            logger.warning("skip %s: blank", f.name)
+            continue
+        n += 1
+        yield paper
 
 
 __all__ = ["Paper", "iter_papers", "load_paper"]
